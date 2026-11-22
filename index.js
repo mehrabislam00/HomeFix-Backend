@@ -13,96 +13,228 @@ app.use(cors());
 
 const client = new MongoClient(`mongodb://${process.env.MONGODB_USERNAME}:${process.env.MONGODB_PASSWORD}@ac-asbrkvt-shard-00-00.i2pehxb.mongodb.net:27017,ac-asbrkvt-shard-00-01.i2pehxb.mongodb.net:27017,ac-asbrkvt-shard-00-02.i2pehxb.mongodb.net:27017/?ssl=true&replicaSet=atlas-946ygn-shard-0&authSource=admin`);
 export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.dir(err);
-  }
+  await client.connect();
+  console.log("You successfully connected to MongoDB!");
+  return client;
 }
 
 // Connect once at startup
-const connectClient = await connectToMongoDB();
+await connectToMongoDB();
 const database = client.db("HomeFix_DB");
 const userCollection = database.collection("user");
+const customerCollection = database.collection("customers");
+const technicianCollection = database.collection("technicians");
+const roleProfiles = {
+  customer: {
+    collection: customerCollection,
+    fields: {},
+    removeFields: ["address"],
+  },
+  technician: {
+    collection: technicianCollection,
+    fields: {
+      skills: [],
+      experience: 0,
+      serviceCategories: [],
+      availability: {},
+    },
+    removeFields: ["address"],
+  },
+};
+const commonUserDefaults = {
+  name: "",
+  email: "",
+  image: "",
+  emailVerified: false,
+  role: "",
+  phone: "",
+  area: "",
+  bio: "",
+};
+const commonUserFields = [...Object.keys(commonUserDefaults), "createdAt", "updatedAt"];
+
+await Promise.all([
+  customerCollection.createIndex({ userId: 1 }, { unique: true }),
+  technicianCollection.createIndex({ userId: 1 }, { unique: true }),
+]);
+
+const syncRoleProfile = async (user) => {
+  const roleProfile = roleProfiles[user.role];
+  if (!roleProfile) {
+    return;
+  }
+
+  const createdAt = user.createdAt ?? new Date();
+  const commonUser = Object.fromEntries(
+    Object.entries(commonUserDefaults).map(([field, fallback]) => [
+      field,
+      field === "role" ? user.role : user[field] ?? fallback,
+    ])
+  );
+  commonUser.createdAt = createdAt;
+  commonUser.updatedAt = user.updatedAt ?? createdAt;
+
+  const profileFields = Object.fromEntries(
+    Object.entries(commonUser).map(([field, value]) => [field, { $literal: value }])
+  );
+  profileFields.userId = { $literal: user._id };
+  for (const [field, fallback] of Object.entries(roleProfile.fields)) {
+    profileFields[field] = {
+      $ifNull: [`$${field}`, { $literal: user[field] ?? fallback }],
+    };
+  }
+  const profileUpdates = [{ $set: profileFields }];
+  if (roleProfile.removeFields) {
+    profileUpdates.push({ $unset: roleProfile.removeFields });
+  }
+
+  try {
+    await roleProfile.collection.updateOne(
+      { userId: user._id },
+      profileUpdates,
+      { upsert: true }
+    );
+  } catch (error) {
+    if (
+      error.code !== 11000 ||
+      !(await roleProfile.collection.findOne({ userId: user._id }))
+    ) {
+      throw error;
+    }
+  }
+};
+
+const syncExistingRoleProfiles = async () => {
+  const users = userCollection.find({ role: { $in: ["customer", "technician"] } });
+  for await (const user of users) {
+    await syncRoleProfile(user);
+  }
+};
+
+const watchUserRegistrations = async () => {
+  while (true) {
+    let changeStream;
+    try {
+      changeStream = userCollection.watch([], { fullDocument: "updateLookup" });
+      for await (const change of changeStream) {
+        if (change.fullDocument) {
+          await syncRoleProfile(change.fullDocument);
+        }
+      }
+    } catch (error) {
+      console.error("User profile synchronization failed:", error);
+      try {
+        await syncExistingRoleProfiles();
+      } catch (syncError) {
+        console.error("User profile resynchronization failed:", syncError);
+      }
+    } finally {
+      if (changeStream) {
+        try {
+          await changeStream.close();
+        } catch (error) {
+          console.error("Could not close user change stream:", error);
+        }
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+};
+
+void watchUserRegistrations();
+await syncExistingRoleProfiles();
 
 // Authentication routes
 // Better Auth authentication endpoints are managed by the existing auth service.
 
 // User Management routes
-app.get("/customers", async (req, res) => {
-  const customers = await userCollection.find({ role: "customer" }).toArray();
-  res.send(customers);
-});
-
-app.get("/customers/:id", async (req, res) => {
-  const id = req.params.id;
-  const customer = await userCollection.findOne({
-    _id: new ObjectId(id),
-    role: "customer",
-  });
-  res.send(customer);
-});
-
-app.patch("/customers/:id", async (req, res) => {
-  const id = req.params.id;
-  const updatedCustomer = req.body;
-
-  const result = await userCollection.updateOne(
-    { _id: new ObjectId(id), role: "customer" },
-    {
-      $set: {
-        ...(updatedCustomer.name !== undefined && { name: updatedCustomer.name }),
-        ...(updatedCustomer.image !== undefined && { image: updatedCustomer.image }),
-        ...(updatedCustomer.phone !== undefined && { phone: updatedCustomer.phone }),
-        ...(updatedCustomer.area !== undefined && { area: updatedCustomer.area }),
-        ...(updatedCustomer.bio !== undefined && { bio: updatedCustomer.bio }),
-        ...(updatedCustomer.address !== undefined && { address: updatedCustomer.address }),
-      },
-    }
+const getRoleProfile = async (user, roleProfile) => {
+  await syncRoleProfile(user);
+  const profile = await roleProfile.collection.findOne({ userId: user._id });
+  const commonUser = Object.fromEntries(
+    commonUserFields.map((field) => [
+      field,
+      field === "createdAt" ? user.createdAt : user[field],
+    ])
   );
+  return {
+    ...commonUser,
+    ...profile,
+    _id: user._id,
+    userId: user._id,
+    profileId: profile._id,
+  };
+};
 
+const getRoleUsers = async (role) => {
+  const roleProfile = roleProfiles[role];
+  const users = await userCollection.find({ role }).toArray();
+  return Promise.all(users.map((user) => getRoleProfile(user, roleProfile)));
+};
+
+const getRoleUser = async (id, role) => {
+  const user = await userCollection.findOne({ _id: new ObjectId(id), role });
+  return user ? getRoleProfile(user, roleProfiles[role]) : null;
+};
+
+const updateRoleUser = async (req, res, role) => {
+  const roleProfile = roleProfiles[role];
+  const userId = new ObjectId(req.params.id);
+  const userUpdates = {};
+  const profileUpdates = {};
+
+  for (const field of ["name", "image", "phone", "area", "bio"]) {
+    if (req.body[field] !== undefined) {
+      userUpdates[field] = req.body[field];
+    }
+  }
+  for (const field of Object.keys(roleProfile.fields)) {
+    if (req.body[field] !== undefined) {
+      profileUpdates[field] = req.body[field];
+    }
+  }
+  const hasUpdates =
+    Object.keys(userUpdates).length > 0 || Object.keys(profileUpdates).length > 0;
+  const updatedAt = new Date();
+  if (hasUpdates) userUpdates.updatedAt = updatedAt;
+
+  const user = await userCollection.findOne({ _id: userId, role });
+  if (!user) {
+    return res.send({ matchedCount: 0, modifiedCount: 0 });
+  }
+  let result = { matchedCount: 1, modifiedCount: 0 };
+  if (Object.keys(userUpdates).length > 0) {
+    result = await userCollection.updateOne(
+      { _id: userId },
+      { $set: userUpdates }
+    );
+  }
+
+  await syncRoleProfile({ ...user, ...userUpdates });
+  if (Object.keys(profileUpdates).length > 0) {
+    result = await roleProfile.collection.updateOne(
+      { userId },
+      { $set: { ...profileUpdates, updatedAt } }
+    );
+  }
   res.send(result);
+};
+
+app.get("/customers", async (req, res) => {
+  res.send(await getRoleUsers("customer"));
 });
+app.get("/customers/:id", async (req, res) => {
+  res.send(await getRoleUser(req.params.id, "customer"));
+});
+app.patch("/customers/:id", (req, res) => updateRoleUser(req, res, "customer"));
 
 app.get("/technicians", async (req, res) => {
-  const technicians = await userCollection.find({ role: "technician" }).toArray();
-  res.send(technicians);
+  res.send(await getRoleUsers("technician"));
 });
-
 app.get("/technicians/:id", async (req, res) => {
-  const id = req.params.id;
-  const technician = await userCollection.findOne({
-    _id: new ObjectId(id),
-    role: "technician",
-  });
-  res.send(technician);
+  res.send(await getRoleUser(req.params.id, "technician"));
 });
-
-app.patch("/technicians/:id", async (req, res) => {
-  const id = req.params.id;
-  const updatedTechnician = req.body;
-
-  const result = await userCollection.updateOne(
-    { _id: new ObjectId(id), role: "technician" },
-    {
-      $set: {
-        ...(updatedTechnician.name !== undefined && { name: updatedTechnician.name }),
-        ...(updatedTechnician.image !== undefined && { image: updatedTechnician.image }),
-        ...(updatedTechnician.phone !== undefined && { phone: updatedTechnician.phone }),
-        ...(updatedTechnician.area !== undefined && { area: updatedTechnician.area }),
-        ...(updatedTechnician.bio !== undefined && { bio: updatedTechnician.bio }),
-        ...(updatedTechnician.skills !== undefined && { skills: updatedTechnician.skills }),
-        ...(updatedTechnician.experience !== undefined && { experience: updatedTechnician.experience }),
-        ...(updatedTechnician.serviceCategories !== undefined && { serviceCategories: updatedTechnician.serviceCategories }),
-        ...(updatedTechnician.availability !== undefined && { availability: updatedTechnician.availability }),
-      },
-    }
-  );
-
-  res.send(result);
-});
+app.patch("/technicians/:id", (req, res) => updateRoleUser(req, res, "technician"));
 
 // Existing user-management endpoints
 app.get("/users", async (req, res) => {
@@ -139,10 +271,15 @@ app.patch("/users/:id", async (req, res) => {
       ...(updatedUser.phone !== undefined && { phone: updatedUser.phone }),
       ...(updatedUser.area !== undefined && { area: updatedUser.area }),
       ...(updatedUser.bio !== undefined && { bio: updatedUser.bio }),
+      updatedAt: new Date(),
     },
   };
 
   const result = await userCollection.updateOne(filter, updateDoc);
+  const refreshedUser = await userCollection.findOne(filter);
+  if (refreshedUser) {
+    await syncRoleProfile(refreshedUser);
+  }
 
   res.send(result);
 });
