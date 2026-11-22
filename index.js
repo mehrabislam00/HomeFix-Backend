@@ -27,14 +27,84 @@ const connectClient = await connectToMongoDB();
 const database = client.db("HomeFix_DB");
 const userCollection = database.collection("user");
 
+// Authentication routes
+// Better Auth authentication endpoints are managed by the existing auth service.
 
-//this is a test route to check if the server is running
-app.get("/", (req, res) => {
-  res.send("Hello World!");
+// User Management routes
+app.get("/customers", async (req, res) => {
+  const customers = await userCollection.find({ role: "customer" }).toArray();
+  res.send(customers);
 });
 
+app.get("/customers/:id", async (req, res) => {
+  const id = req.params.id;
+  const customer = await userCollection.findOne({
+    _id: new ObjectId(id),
+    role: "customer",
+  });
+  res.send(customer);
+});
 
-//get all users
+app.patch("/customers/:id", async (req, res) => {
+  const id = req.params.id;
+  const updatedCustomer = req.body;
+
+  const result = await userCollection.updateOne(
+    { _id: new ObjectId(id), role: "customer" },
+    {
+      $set: {
+        ...(updatedCustomer.name !== undefined && { name: updatedCustomer.name }),
+        ...(updatedCustomer.image !== undefined && { image: updatedCustomer.image }),
+        ...(updatedCustomer.phone !== undefined && { phone: updatedCustomer.phone }),
+        ...(updatedCustomer.area !== undefined && { area: updatedCustomer.area }),
+        ...(updatedCustomer.bio !== undefined && { bio: updatedCustomer.bio }),
+        ...(updatedCustomer.address !== undefined && { address: updatedCustomer.address }),
+      },
+    }
+  );
+
+  res.send(result);
+});
+
+app.get("/technicians", async (req, res) => {
+  const technicians = await userCollection.find({ role: "technician" }).toArray();
+  res.send(technicians);
+});
+
+app.get("/technicians/:id", async (req, res) => {
+  const id = req.params.id;
+  const technician = await userCollection.findOne({
+    _id: new ObjectId(id),
+    role: "technician",
+  });
+  res.send(technician);
+});
+
+app.patch("/technicians/:id", async (req, res) => {
+  const id = req.params.id;
+  const updatedTechnician = req.body;
+
+  const result = await userCollection.updateOne(
+    { _id: new ObjectId(id), role: "technician" },
+    {
+      $set: {
+        ...(updatedTechnician.name !== undefined && { name: updatedTechnician.name }),
+        ...(updatedTechnician.image !== undefined && { image: updatedTechnician.image }),
+        ...(updatedTechnician.phone !== undefined && { phone: updatedTechnician.phone }),
+        ...(updatedTechnician.area !== undefined && { area: updatedTechnician.area }),
+        ...(updatedTechnician.bio !== undefined && { bio: updatedTechnician.bio }),
+        ...(updatedTechnician.skills !== undefined && { skills: updatedTechnician.skills }),
+        ...(updatedTechnician.experience !== undefined && { experience: updatedTechnician.experience }),
+        ...(updatedTechnician.serviceCategories !== undefined && { serviceCategories: updatedTechnician.serviceCategories }),
+        ...(updatedTechnician.availability !== undefined && { availability: updatedTechnician.availability }),
+      },
+    }
+  );
+
+  res.send(result);
+});
+
+// Existing user-management endpoints
 app.get("/users", async (req, res) => {
     const cursor = userCollection.find({});
     const users = await cursor.toArray();
@@ -54,14 +124,18 @@ app.patch("/users/:id", async (req, res) => {
   const id = req.params.id;
   const updatedUser = req.body;
 
+  if (updatedUser.email !== undefined || updatedUser.role !== undefined) {
+    return res.status(400).send({
+      message: "Email and role changes must use the authentication management APIs",
+    });
+  }
+
   const filter = { _id: new ObjectId(id) };
 
   const updateDoc = {
     $set: {
       ...(updatedUser.name !== undefined && { name: updatedUser.name }),
-      ...(updatedUser.email !== undefined && { email: updatedUser.email }),
       ...(updatedUser.image !== undefined && { image: updatedUser.image }),
-      ...(updatedUser.role !== undefined && { role: updatedUser.role }),
       ...(updatedUser.phone !== undefined && { phone: updatedUser.phone }),
       ...(updatedUser.area !== undefined && { area: updatedUser.area }),
       ...(updatedUser.bio !== undefined && { bio: updatedUser.bio }),
@@ -73,6 +147,11 @@ app.patch("/users/:id", async (req, res) => {
   res.send(result);
 });
 
+// Other routes
+// Health check
+app.get("/", (req, res) => {
+  res.send("Hello World!");
+});
 
 
 // Start the server
