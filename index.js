@@ -1,6 +1,7 @@
 import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { SignJWT, jwtVerify } from "jose";
 import Stripe from "stripe";
 import "dotenv/config";
 import cors from "cors";
@@ -424,6 +425,270 @@ const updateRoleUser = async (req, res, role) => {
   }
   res.send(result);
 };
+
+const jwtSecret = process.env.JWT_SECRET;
+const jwtLifetime = 15 * 60;
+const jwtIssuer = "homefix-backend";
+const jwtAudience = "homefix-api";
+
+const createAccessToken = async (user, session) => {
+  const now = Math.floor(Date.now() / 1000);
+  return new SignJWT({
+    sid: session._id.toString(),
+    role: user.role,
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setSubject(user._id.toString())
+    .setIssuer(jwtIssuer)
+    .setAudience(jwtAudience)
+    .setIssuedAt(now)
+    .setExpirationTime(now + jwtLifetime)
+    .sign(new TextEncoder().encode(jwtSecret));
+};
+
+const verifyAccessToken = async (token) => {
+  if (!jwtSecret || typeof token !== "string") return null;
+  try {
+    const { payload, protectedHeader } = await jwtVerify(
+      token,
+      new TextEncoder().encode(jwtSecret),
+      { algorithms: ["HS256"], issuer: jwtIssuer, audience: jwtAudience }
+    );
+    if (
+      protectedHeader.typ !== "JWT" ||
+      typeof payload.sub !== "string" ||
+      !ObjectId.isValid(payload.sub) ||
+      typeof payload.sid !== "string" ||
+      !ObjectId.isValid(payload.sid) ||
+      !["customer", "technician", "admin"].includes(payload.role) ||
+      !Number.isInteger(payload.iat) ||
+      payload.iat > Math.floor(Date.now() / 1000) + 60
+    ) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+};
+
+const getBetterAuthSession = async (req) => {
+  const secret = process.env.BETTER_AUTH_SECRET;
+  const cookieHeader = req.headers.cookie;
+  if (!secret || typeof cookieHeader !== "string") return null;
+
+  const cookies = new Map(
+    cookieHeader.split(";").map((part) => {
+      const separator = part.indexOf("=");
+      return separator < 0
+        ? [part.trim(), ""]
+        : [part.slice(0, separator).trim(), part.slice(separator + 1).trim()];
+    })
+  );
+  const signedCookie =
+    cookies.get("__Secure-better-auth.session_token") ||
+    cookies.get("better-auth.session_token");
+  if (!signedCookie) return null;
+
+  let value;
+  try {
+    value = decodeURIComponent(signedCookie);
+  } catch {
+    return null;
+  }
+  const signatureSeparator = value.lastIndexOf(".");
+  if (signatureSeparator < 1) return null;
+  const sessionToken = value.slice(0, signatureSeparator);
+  const suppliedSignature = Buffer.from(value.slice(signatureSeparator + 1), "base64");
+  const expectedSignature = createHmac("sha256", secret)
+    .update(sessionToken)
+    .digest();
+  if (
+    suppliedSignature.length !== expectedSignature.length ||
+    !timingSafeEqual(suppliedSignature, expectedSignature)
+  ) {
+    return null;
+  }
+
+  const session = await sessionCollection.findOne({
+    token: sessionToken,
+    expiresAt: { $gt: new Date() },
+  });
+  if (!session) return null;
+  const userId = ObjectId.isValid(session.userId)
+    ? new ObjectId(session.userId)
+    : null;
+  if (!userId || !ObjectId.isValid(session._id)) return null;
+  const user = await userCollection.findOne({ _id: userId });
+  if (!user) return null;
+  return { session, user };
+};
+
+const authorizeRequest = (req, res, user) => {
+  const path = req.path;
+  const deny = () => {
+    res.status(403).send({ message: "Forbidden" });
+    return false;
+  };
+  const matchesRoleId = (role, id) =>
+    user.role === role &&
+    ObjectId.isValid(id) &&
+    new ObjectId(id).equals(user._id);
+
+  if (path.startsWith("/admin/")) {
+    return matchesRoleId("admin", path.split("/")[2]) || deny();
+  }
+  if (path === "/customers" || path === "/technicians" || path === "/users") {
+    return user.role === "admin" || deny();
+  }
+  if (path.startsWith("/customers/")) {
+    const id = path.split("/")[2];
+    return matchesRoleId("customer", id) || user.role === "admin" || deny();
+  }
+  if (path.startsWith("/technicians/")) {
+    const id = path.split("/")[2];
+    if (path.endsWith("/services") && req.method !== "GET") {
+      return matchesRoleId("technician", id) || deny();
+    }
+    return matchesRoleId("technician", id) || user.role === "admin" || deny();
+  }
+  if (path === "/users" || path.startsWith("/users/")) {
+    const id = path.split("/")[2];
+    return (
+      user.role === "admin" ||
+      (ObjectId.isValid(id) && new ObjectId(id).equals(user._id)) ||
+      deny()
+    );
+  }
+  if (path.startsWith("/services/") && req.method !== "GET") {
+    return matchesRoleId("technician", req.body.technicianId) || deny();
+  }
+  if (path === "/bookings" && req.method === "POST") {
+    return matchesRoleId("customer", req.body.customerId) || deny();
+  }
+  if (path.startsWith("/bookings/")) {
+    if (req.method === "PATCH" && path.endsWith("/cancel")) {
+      return user.role === "customer" || deny();
+    }
+    if (req.method === "PATCH") {
+      const hasCustomerId = req.body.customerId !== undefined;
+      const hasTechnicianId = req.body.technicianId !== undefined;
+      if (hasCustomerId === hasTechnicianId) return deny();
+      return hasCustomerId
+        ? matchesRoleId("customer", req.body.customerId) || deny()
+        : matchesRoleId("technician", req.body.technicianId) || deny();
+    }
+  }
+  return true;
+};
+
+const authenticateRequest = async (req, res, next) => {
+  if (req.method === "OPTIONS") return next();
+  if (
+    req.path === "/" ||
+    req.path === "/webhooks/stripe" ||
+    req.path === "/auth/token" ||
+    req.path === "/auth/refresh" ||
+    req.path.startsWith("/notifications/") ||
+    (req.method === "GET" &&
+      (req.path === "/services" ||
+        req.path.startsWith("/services/category/") ||
+        /^\/services\/[^/]+$/.test(req.path)))
+  ) {
+    return next();
+  }
+  const protectedPath = [
+    "/admin/",
+    "/users",
+    "/customers",
+    "/technicians",
+    "/bookings",
+    "/payments",
+    "/services/",
+    "/auth/logout",
+  ].some((prefix) => req.path === prefix.slice(0, -1) || req.path.startsWith(prefix));
+  if (!protectedPath) return next();
+
+  const authorization = req.headers.authorization;
+  if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) {
+    return res.status(401).send({ message: "Bearer token required" });
+  }
+  if (!jwtSecret || jwtSecret.length < 32) {
+    return res.status(503).send({ message: "JWT authentication is not configured" });
+  }
+  const claims = await verifyAccessToken(authorization.slice(7));
+  if (!claims) {
+    return res.status(401).send({ message: "Invalid or expired access token" });
+  }
+  const isLogout = req.path === "/auth/logout";
+  const [session, user] = await Promise.all([
+    sessionCollection.findOne({
+      _id: new ObjectId(claims.sid),
+      userId: new ObjectId(claims.sub),
+      expiresAt: { $gt: new Date() },
+    }),
+    userCollection.findOne({ _id: new ObjectId(claims.sub) }),
+  ]);
+  if (!session && !isLogout) {
+    return res.status(401).send({ message: "Session expired or revoked" });
+  }
+  if (!user || (!isLogout && user.banned === true)) {
+    return res.status(403).send({ message: "Account is unavailable" });
+  }
+  if (!isLogout && user.role !== claims.role) {
+    return res.status(401).send({ message: "Account permissions changed; sign in again" });
+  }
+  req.authUser = user;
+  req.authSession = session || {
+    _id: new ObjectId(claims.sid),
+    userId: new ObjectId(claims.sub),
+  };
+  if (!authorizeRequest(req, res, user)) return;
+  next();
+};
+
+app.use(authenticateRequest);
+
+const issueAccessToken = async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!jwtSecret || jwtSecret.length < 32) {
+    return res.status(503).send({ message: "JWT authentication is not configured" });
+  }
+  if (!process.env.BETTER_AUTH_SECRET) {
+    return res.status(503).send({ message: "Better Auth session verification is not configured" });
+  }
+  const authSession = await getBetterAuthSession(req);
+  if (!authSession) {
+    return res.status(401).send({ message: "A valid Better Auth session is required" });
+  }
+  if (authSession.user.banned === true) {
+    return res.status(403).send({ message: "Account is unavailable" });
+  }
+  if (!["customer", "technician", "admin"].includes(authSession.user.role)) {
+    return res.status(403).send({ message: "Account role is unavailable" });
+  }
+  res.send({
+    accessToken: await createAccessToken(authSession.user, authSession.session),
+    tokenType: "Bearer",
+    expiresIn: jwtLifetime,
+    user: {
+      id: authSession.user._id.toString(),
+      name: authSession.user.name,
+      email: authSession.user.email,
+      role: authSession.user.role,
+    },
+  });
+};
+
+app.post("/auth/token", issueAccessToken);
+app.post("/auth/refresh", issueAccessToken);
+app.post("/auth/logout", async (req, res) => {
+  await sessionCollection.deleteOne({
+    _id: req.authSession._id,
+    userId: req.authUser._id,
+  });
+  res.send({ message: "Session revoked" });
+});
 
 app.get("/customers", async (req, res) => {
   res.send(await getRoleUsers("customer"));
@@ -1044,54 +1309,11 @@ app.get("/technicians/:id/bookings/:bookingId", async (req, res) => {
   res.send(booking);
 });
 
-const verifySignedApiRequest = (req, res, expectedRole) => {
-  const secret = process.env.HOMEFIX_PAYMENT_API_SECRET;
-  const userId = req.headers["x-homefix-user-id"];
-  const role = req.headers["x-homefix-user-role"];
-  const timestamp = req.headers["x-homefix-request-time"];
-  const signature = req.headers["x-homefix-request-signature"];
-  const requestTime = Number(timestamp);
-  if (
-    !secret ||
-    role !== expectedRole ||
-    typeof userId !== "string" ||
-    !ObjectId.isValid(userId) ||
-    typeof timestamp !== "string" ||
-    !/^\d+$/.test(timestamp) ||
-    !Number.isSafeInteger(requestTime) ||
-    Math.abs(Date.now() - requestTime) > 5 * 60 * 1000 ||
-    typeof signature !== "string" ||
-    !/^[a-f\d]{64}$/i.test(signature)
-  ) {
-    res.status(401).send({ message: "Unauthorized request" });
-    return null;
-  }
-  const expectedSignature = createHmac("sha256", secret)
-    .update(
-      `${timestamp}\n${req.method.toUpperCase()}\n${req.path}\n${role}\n${userId}`
-    )
-    .digest();
-  const suppliedSignature = Buffer.from(signature, "hex");
-  if (
-    suppliedSignature.length !== expectedSignature.length ||
-    !timingSafeEqual(suppliedSignature, expectedSignature)
-  ) {
-    res.status(401).send({ message: "Unauthorized request" });
-    return null;
-  }
-  return { userId, role };
-};
-
 app.patch("/bookings/:id/cancel", async (req, res) => {
-  const principal = verifySignedApiRequest(req, res, "customer");
-  if (!principal) return;
   if (!ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ message: "Invalid booking ID" });
   }
-  const customer = await getAccountById(principal.userId, "customer");
-  if (!customer) {
-    return res.status(404).send({ message: "Customer not found" });
-  }
+  const customer = req.authUser;
   const bookingId = new ObjectId(req.params.id);
   const booking = await bookingCollection.findOne({
     _id: bookingId,
@@ -1178,14 +1400,7 @@ app.patch("/bookings/:id", async (req, res) => {
     });
     technicianUpdate = true;
   } else if (req.body.customerId !== undefined) {
-    const principal = verifySignedApiRequest(req, res, "customer");
-    if (!principal || principal.userId !== req.body.customerId) {
-      if (principal) {
-        res.status(403).send({ message: "Customer identity does not match" });
-      }
-      return;
-    }
-    account = await getAccountById(req.body.customerId, "customer");
+    account = req.authUser;
     if (!account) {
       return res.status(404).send({ message: "Customer not found" });
     }
@@ -2361,6 +2576,263 @@ const getRolePayments = async (req, res, role, statistics = false) => {
   }
   res.send(await paymentCollection.find(filter).sort({ paidAt: -1 }).toArray());
 };
+
+const recordVerifiedStripePayment = async (
+  stripe,
+  checkoutSession,
+  eventCreated
+) => {
+  if (checkoutSession.payment_status !== "paid") {
+    return { paymentRecorded: false };
+  }
+  const bookingId =
+    checkoutSession.metadata?.bookingId || checkoutSession.client_reference_id;
+  if (!ObjectId.isValid(bookingId)) {
+    throw new Error("Stripe session has no valid booking reference");
+  }
+  const expectedSessionAmount = checkoutSession.amount_total;
+  const expectedCurrency = "bdt";
+  const transactionId =
+    typeof checkoutSession.payment_intent === "string"
+      ? checkoutSession.payment_intent
+      : checkoutSession.payment_intent?.id;
+  if (
+    typeof transactionId !== "string" ||
+    typeof expectedSessionAmount !== "number" ||
+    checkoutSession.currency !== expectedCurrency
+  ) {
+    throw new Error("Stripe session payment details are incomplete");
+  }
+
+  const paymentIntent = await stripe.paymentIntents.retrieve(transactionId, {
+    expand: ["latest_charge"],
+  });
+  if (
+    paymentIntent.status !== "succeeded" ||
+    paymentIntent.currency !== expectedCurrency
+  ) {
+    throw new Error("Stripe payment has not succeeded in BDT");
+  }
+
+  const bookingObjectId = new ObjectId(bookingId);
+  const databaseSession = client.startSession();
+  let alreadyProcessed = false;
+  try {
+    await databaseSession.withTransaction(async () => {
+      alreadyProcessed = false;
+      const booking = await bookingCollection.findOne(
+        { _id: bookingObjectId },
+        { session: databaseSession }
+      );
+      if (!booking) throw new Error("Referenced booking was not found");
+      if (
+        typeof booking.finalAmount !== "number" ||
+        !Number.isFinite(booking.finalAmount) ||
+        booking.finalAmount <= 0
+      ) {
+        throw new Error("Booking has an invalid final amount");
+      }
+      const expectedBookingAmount = Math.round(booking.finalAmount * 100);
+      if (
+        expectedSessionAmount !== expectedBookingAmount ||
+        paymentIntent.amount_received !== expectedBookingAmount
+      ) {
+        throw new Error("Stripe payment amount does not match the booking finalAmount");
+      }
+
+      const existingPayment = await paymentCollection.findOne(
+        {
+          $or: [
+            { bookingId: booking._id.toString() },
+            { stripeSessionId: checkoutSession.id },
+          ],
+        },
+        { session: databaseSession }
+      );
+      const paidAt =
+        paymentIntent.latest_charge &&
+        typeof paymentIntent.latest_charge === "object" &&
+        paymentIntent.latest_charge.created
+          ? new Date(paymentIntent.latest_charge.created * 1000)
+          : new Date(eventCreated * 1000);
+      if (existingPayment) {
+        if (
+          existingPayment.bookingId !== booking._id.toString() ||
+          existingPayment.stripeSessionId !== checkoutSession.id ||
+          existingPayment.transactionId !== transactionId ||
+          existingPayment.amount !== booking.finalAmount
+        ) {
+          throw new Error("Booking or Stripe session already has a different payment record");
+        }
+        if (
+          booking.paymentStatus === "paid" &&
+          booking.stripeSessionId &&
+          booking.stripeSessionId !== checkoutSession.id
+        ) {
+          throw new Error("Booking is already paid by a different Stripe session");
+        }
+        if (booking.paymentStatus !== "paid") {
+          await bookingCollection.updateOne(
+            { _id: booking._id },
+            {
+              $set: {
+                paymentStatus: "paid",
+                transactionId,
+                stripeSessionId: checkoutSession.id,
+                paidAt,
+              },
+            },
+            { session: databaseSession }
+          );
+        }
+        await notifyCompletedPayment(
+          booking,
+          existingPayment._id.toString(),
+          checkoutSession.id,
+          databaseSession
+        );
+        alreadyProcessed = true;
+        return;
+      }
+      if (booking.paymentStatus === "paid") {
+        throw new Error("Booking is marked paid without a matching payment record");
+      }
+
+      const [customer, technician] = await Promise.all([
+        getAccountById(booking.customerId, "customer"),
+        getAccountById(booking.technicianId, "technician"),
+      ]);
+      const paymentCustomerName = customer?.name || booking.customerName;
+      const paymentCustomerEmail = customer?.email || booking.customerEmail;
+      const paymentTechnicianName = technician?.name || booking.technicianName;
+      const paymentTechnicianEmail =
+        technician?.email || booking.technicianEmail;
+      const paymentCustomerId = customer?._id.toString() || booking.customerId;
+      const paymentTechnicianId =
+        technician?._id.toString() || booking.technicianId;
+      if (
+        ![
+          booking.serviceTitle,
+          paymentCustomerName,
+          paymentCustomerEmail,
+          paymentTechnicianName,
+          paymentTechnicianEmail,
+          paymentCustomerId,
+          paymentTechnicianId,
+        ].every((value) => typeof value === "string" && value.trim())
+      ) {
+        throw new Error("Booking is missing required payment ownership or service details");
+      }
+
+      const insertedPayment = await paymentCollection.insertOne(
+        {
+          bookingId: booking._id.toString(),
+          customerId: paymentCustomerId,
+          technicianId: paymentTechnicianId,
+          serviceTitle: booking.serviceTitle,
+          customerName: paymentCustomerName,
+          customerEmail: paymentCustomerEmail,
+          technicianName: paymentTechnicianName,
+          technicianEmail: paymentTechnicianEmail,
+          amount: booking.finalAmount,
+          currency: expectedCurrency,
+          transactionId,
+          stripeSessionId: checkoutSession.id,
+          paymentStatus: "paid",
+          paidAt,
+        },
+        { session: databaseSession }
+      );
+      const bookingUpdate = await bookingCollection.updateOne(
+        { _id: booking._id, paymentStatus: { $ne: "paid" } },
+        {
+          $set: {
+            paymentStatus: "paid",
+            transactionId,
+            stripeSessionId: checkoutSession.id,
+            paidAt,
+          },
+        },
+        { session: databaseSession }
+      );
+      if (bookingUpdate.matchedCount !== 1) {
+        throw new Error("Booking payment status changed while recording payment");
+      }
+      await notifyCompletedPayment(
+        {
+          ...booking,
+          customerId: paymentCustomerId,
+          technicianId: paymentTechnicianId,
+        },
+        insertedPayment.insertedId.toString(),
+        checkoutSession.id,
+        databaseSession
+      );
+    });
+  } finally {
+    await databaseSession.endSession();
+  }
+  return {
+    bookingId,
+    paymentRecorded: !alreadyProcessed,
+  };
+};
+
+app.post("/payments/checkout/:sessionId/confirm", async (req, res) => {
+  if (req.authUser.role !== "customer") {
+    return res.status(403).send({ message: "Customer access required" });
+  }
+  if (!/^cs_(test|live)_/.test(req.params.sessionId)) {
+    return res.status(400).send({ message: "Invalid Stripe checkout session ID" });
+  }
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(503).send({ message: "Stripe payment verification is not configured" });
+  }
+
+  try {
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    const checkoutSession = await stripe.checkout.sessions.retrieve(
+      req.params.sessionId,
+      { expand: ["payment_intent"] }
+    );
+    const bookingId =
+      checkoutSession.metadata?.bookingId ||
+      checkoutSession.client_reference_id;
+    if (!ObjectId.isValid(bookingId)) {
+      return res.status(404).send({ message: "Booking not found" });
+    }
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail: req.authUser.email,
+      customerId: req.authUser._id.toString(),
+    });
+    if (!booking) {
+      return res.status(404).send({ message: "Booking not found" });
+    }
+    if (
+      checkoutSession.metadata?.bookingId !== bookingId &&
+      checkoutSession.client_reference_id !== bookingId
+    ) {
+      return res.status(400).send({ message: "Checkout session does not match the booking" });
+    }
+    if (checkoutSession.status === "expired") {
+      return res.send({ status: "expired" });
+    }
+    if (checkoutSession.payment_status !== "paid") {
+      return res.send({ status: "pending" });
+    }
+
+    const result = await recordVerifiedStripePayment(
+      stripe,
+      checkoutSession,
+      Math.floor(Date.now() / 1000)
+    );
+    return res.send({ status: "paid", ...result });
+  } catch (error) {
+    console.error("Unable to confirm customer checkout:", error.message);
+    return res.status(502).send({ message: "Unable to verify Stripe payment" });
+  }
+});
 
 app.post("/webhooks/stripe", async (req, res) => {
   if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
