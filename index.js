@@ -1527,9 +1527,11 @@ app.get("/admin/:adminId/users/:userId", async (req, res) => {
   res.send(await getAdminUser(user));
 });
 
-app.patch("/admin/:adminId/users/:userId", async (req, res) => {
+const updateAdminUser = async (req, res, expectedRole) => {
   if (!(await requireAdmin(req, res))) return;
-  if (!ObjectId.isValid(req.params.userId)) {
+  const userIdValue =
+    req.params.userId || req.params.customerId || req.params.technicianId;
+  if (!ObjectId.isValid(userIdValue)) {
     return res.status(400).send({ message: "Invalid user ID" });
   }
   if (req.body.role !== undefined || req.body.email !== undefined) {
@@ -1537,9 +1539,17 @@ app.patch("/admin/:adminId/users/:userId", async (req, res) => {
       message: "Email and role changes must use the authentication management APIs",
     });
   }
-  const userId = new ObjectId(req.params.userId);
-  const user = await userCollection.findOne({ _id: userId });
-  if (!user) return res.status(404).send({ message: "User not found" });
+  const userId = new ObjectId(userIdValue);
+  const user = await userCollection.findOne({
+    _id: userId,
+    ...(expectedRole ? { role: expectedRole } : {}),
+  });
+  if (!user) {
+    const roleName = expectedRole
+      ? `${expectedRole[0].toUpperCase()}${expectedRole.slice(1)}`
+      : "User";
+    return res.status(404).send({ message: `${roleName} not found` });
+  }
 
   const userUpdates = {};
   const profileUpdates = {};
@@ -1557,7 +1567,7 @@ app.patch("/admin/:adminId/users/:userId", async (req, res) => {
     }
     userUpdates.banned = req.body.banned;
   }
-  if (req.body.emailVerified !== undefined) {
+  if (expectedRole === undefined && req.body.emailVerified !== undefined) {
     if (typeof req.body.emailVerified !== "boolean") {
       return res.status(400).send({ message: "emailVerified must be a boolean" });
     }
@@ -1603,7 +1613,11 @@ app.patch("/admin/:adminId/users/:userId", async (req, res) => {
   }
   const refreshedUser = await userCollection.findOne({ _id: userId });
   res.send(await getAdminUser(refreshedUser));
-});
+};
+
+app.patch("/admin/:adminId/users/:userId", (req, res) =>
+  updateAdminUser(req, res)
+);
 
 app.patch("/admin/:adminId/users/:userId/ban", async (req, res) => {
   if (!(await requireAdmin(req, res))) return;
@@ -1707,34 +1721,9 @@ app.get("/admin/:adminId/customers/:customerId", async (req, res) => {
   });
 });
 
-app.patch("/admin/:adminId/customers/:customerId", async (req, res) => {
-  if (!(await requireAdmin(req, res))) return;
-  const customer = await getAdminUserByRole(req.params.customerId, "customer");
-  if (!customer) return res.status(404).send({ message: "Customer not found" });
-  const userId = new ObjectId(customer._id);
-  const updates = {};
-  for (const field of ["name", "image", "phone", "area", "bio"]) {
-    if (req.body[field] !== undefined) {
-      if (typeof req.body[field] !== "string") {
-        return res.status(400).send({ message: `${field} must be a string` });
-      }
-      updates[field] = req.body[field];
-    }
-  }
-  if (req.body.banned !== undefined) {
-    if (typeof req.body.banned !== "boolean") {
-      return res.status(400).send({ message: "banned must be a boolean" });
-    }
-    updates.banned = req.body.banned;
-  }
-  if (Object.keys(updates).length === 0) {
-    return res.status(400).send({ message: "No customer fields to update" });
-  }
-  updates.updatedAt = new Date();
-  await userCollection.updateOne({ _id: userId }, { $set: updates });
-  const updated = await userCollection.findOne({ _id: userId });
-  res.send(await getAdminUser(updated));
-});
+app.patch("/admin/:adminId/customers/:customerId", (req, res) =>
+  updateAdminUser(req, res, "customer")
+);
 
 app.delete("/admin/:adminId/customers/:customerId", async (req, res) => {
   if (!(await requireAdmin(req, res))) return;
@@ -1777,64 +1766,9 @@ app.get("/admin/:adminId/technicians/:technicianId", async (req, res) => {
   });
 });
 
-app.patch("/admin/:adminId/technicians/:technicianId", async (req, res) => {
-  if (!(await requireAdmin(req, res))) return;
-  const technician = await getAdminUserByRole(req.params.technicianId, "technician");
-  if (!technician) return res.status(404).send({ message: "Technician not found" });
-  const userId = new ObjectId(technician._id);
-  const userUpdates = {};
-  const profileUpdates = {};
-  for (const field of ["name", "image", "phone", "area", "bio"]) {
-    if (req.body[field] !== undefined) {
-      if (typeof req.body[field] !== "string") {
-        return res.status(400).send({ message: `${field} must be a string` });
-      }
-      userUpdates[field] = req.body[field];
-    }
-  }
-  if (req.body.banned !== undefined) {
-    if (typeof req.body.banned !== "boolean") {
-      return res.status(400).send({ message: "banned must be a boolean" });
-    }
-    userUpdates.banned = req.body.banned;
-  }
-  for (const field of ["skills", "experience", "serviceCategories", "availability"]) {
-    if (req.body[field] === undefined) continue;
-    if (
-      ["skills", "serviceCategories"].includes(field) &&
-      !Array.isArray(req.body[field])
-    ) {
-      return res.status(400).send({ message: `${field} must be an array` });
-    }
-    if (field === "experience" && typeof req.body[field] !== "number") {
-      return res.status(400).send({ message: "experience must be a number" });
-    }
-    if (
-      field === "availability" &&
-      (req.body[field] === null ||
-        typeof req.body[field] !== "object" ||
-        Array.isArray(req.body[field]))
-    ) {
-      return res.status(400).send({ message: "availability must be an object" });
-    }
-    profileUpdates[field] = req.body[field];
-  }
-  if (Object.keys(userUpdates).length === 0 && Object.keys(profileUpdates).length === 0) {
-    return res.status(400).send({ message: "No technician fields to update" });
-  }
-  if (Object.keys(userUpdates).length > 0) {
-    userUpdates.updatedAt = new Date();
-    await userCollection.updateOne({ _id: userId }, { $set: userUpdates });
-  }
-  if (Object.keys(profileUpdates).length > 0) {
-    await technicianCollection.updateOne(
-      { userId },
-      { $set: { ...profileUpdates, updatedAt: new Date() } },
-      { upsert: true }
-    );
-  }
-  res.send(await getAdminUser(await userCollection.findOne({ _id: userId })));
-});
+app.patch("/admin/:adminId/technicians/:technicianId", (req, res) =>
+  updateAdminUser(req, res, "technician")
+);
 
 app.delete("/admin/:adminId/technicians/:technicianId", async (req, res) => {
   if (!(await requireAdmin(req, res))) return;
@@ -2396,6 +2330,38 @@ const getPaymentDetails = async (payment) => {
   return { ...payment, booking: booking || null };
 };
 
+const getRolePayments = async (req, res, role, statistics = false) => {
+  const account = await getAccountById(req.params.id, role);
+  if (!account) {
+    return res.status(404).send({
+      message: role === "customer" ? "Customer not found" : "Technician not found",
+    });
+  }
+  const idField = role === "customer" ? "customerId" : "technicianId";
+  const emailField = role === "customer" ? "customerEmail" : "technicianEmail";
+  const filter = getPaymentOwnerFilter(
+    account._id.toString(),
+    idField,
+    emailField,
+    account.email
+  );
+  if (statistics) {
+    return res.send(await getPaymentStatistics(filter));
+  }
+  if (req.params.paymentId) {
+    if (!ObjectId.isValid(req.params.paymentId)) {
+      return res.status(400).send({ message: "Invalid payment ID" });
+    }
+    const payment = await paymentCollection.findOne({
+      _id: new ObjectId(req.params.paymentId),
+      ...filter,
+    });
+    if (!payment) return res.status(404).send({ message: "Payment not found" });
+    return res.send(await getPaymentDetails(payment));
+  }
+  res.send(await paymentCollection.find(filter).sort({ paidAt: -1 }).toArray());
+};
+
 app.post("/webhooks/stripe", async (req, res) => {
   if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
     console.error("Stripe webhook received but STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET is missing.");
@@ -2766,107 +2732,27 @@ app.post("/webhooks/stripe", async (req, res) => {
 });
 
 app.get("/customers/:id/payments/stats", async (req, res) => {
-  const customer = await getAccountById(req.params.id, "customer");
-  if (!customer) return res.status(404).send({ message: "Customer not found" });
-  res.send(
-    await getPaymentStatistics(
-      getPaymentOwnerFilter(
-        customer._id.toString(),
-        "customerId",
-        "customerEmail",
-        customer.email
-      )
-    )
-  );
+  await getRolePayments(req, res, "customer", true);
 });
 
 app.get("/customers/:id/payments", async (req, res) => {
-  const customer = await getAccountById(req.params.id, "customer");
-  if (!customer) return res.status(404).send({ message: "Customer not found" });
-  res.send(
-    await paymentCollection
-      .find(
-        getPaymentOwnerFilter(
-          customer._id.toString(),
-          "customerId",
-          "customerEmail",
-          customer.email
-        )
-      )
-      .sort({ paidAt: -1 })
-      .toArray()
-  );
+  await getRolePayments(req, res, "customer");
 });
 
 app.get("/customers/:id/payments/:paymentId", async (req, res) => {
-  const customer = await getAccountById(req.params.id, "customer");
-  if (!customer) return res.status(404).send({ message: "Customer not found" });
-  if (!ObjectId.isValid(req.params.paymentId)) {
-    return res.status(400).send({ message: "Invalid payment ID" });
-  }
-  const payment = await paymentCollection.findOne({
-    _id: new ObjectId(req.params.paymentId),
-    ...getPaymentOwnerFilter(
-      customer._id.toString(),
-      "customerId",
-      "customerEmail",
-      customer.email
-    ),
-  });
-  if (!payment) return res.status(404).send({ message: "Payment not found" });
-  res.send(await getPaymentDetails(payment));
+  await getRolePayments(req, res, "customer");
 });
 
 app.get("/technicians/:id/payments/stats", async (req, res) => {
-  const technician = await getAccountById(req.params.id, "technician");
-  if (!technician) return res.status(404).send({ message: "Technician not found" });
-  res.send(
-    await getPaymentStatistics(
-      getPaymentOwnerFilter(
-        technician._id.toString(),
-        "technicianId",
-        "technicianEmail",
-        technician.email
-      )
-    )
-  );
+  await getRolePayments(req, res, "technician", true);
 });
 
 app.get("/technicians/:id/payments", async (req, res) => {
-  const technician = await getAccountById(req.params.id, "technician");
-  if (!technician) return res.status(404).send({ message: "Technician not found" });
-  res.send(
-    await paymentCollection
-      .find(
-        getPaymentOwnerFilter(
-          technician._id.toString(),
-          "technicianId",
-          "technicianEmail",
-          technician.email
-        )
-      )
-      .sort({ paidAt: -1 })
-      .toArray()
-  );
+  await getRolePayments(req, res, "technician");
 });
 
 app.get("/technicians/:id/payments/:paymentId", async (req, res) => {
-  const technician = await getAccountById(req.params.id, "technician");
-  if (!technician) return res.status(404).send({ message: "Technician not found" });
-  if (!ObjectId.isValid(req.params.paymentId)) {
-    return res.status(400).send({ message: "Invalid payment ID" });
-  }
-  const payment = await paymentCollection.findOne({
-    _id: new ObjectId(req.params.paymentId),
-    ...getPaymentOwnerFilter(
-      technician._id.toString(),
-      "technicianId",
-      "technicianEmail",
-      technician.email
-    ),
-  });
-  if (!payment) return res.status(404).send({ message: "Payment not found" });
-  res.send(await getPaymentDetails(payment));
+  await getRolePayments(req, res, "technician");
 });
 
 app.get("/admin/:adminId/payments/stats", async (req, res) => {
