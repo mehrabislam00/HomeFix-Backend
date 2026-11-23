@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: "8mb" }));
 app.use(cors());
 
 // MongoDB connection
@@ -22,6 +22,8 @@ export async function connectToMongoDB() {
 await connectToMongoDB();
 const database = client.db("HomeFix_DB");
 const userCollection = database.collection("user");
+const accountCollection = database.collection("account");
+const sessionCollection = database.collection("session");
 const customerCollection = database.collection("customers");
 const technicianCollection = database.collection("technicians");
 const serviceCollection = database.collection("services");
@@ -302,6 +304,7 @@ const serviceFields = [
   "category",
   "description",
   "image",
+  "availability",
   "basePrice",
   "estimatedDuration",
   "serviceMode",
@@ -494,40 +497,75 @@ app.post("/bookings", async (req, res) => {
   if (!service) {
     return res.status(404).send({ message: "Available service not found" });
   }
+  const preferredDateValue = req.body.preferredDate ?? req.body.date;
+  const customerPhone = req.body.customerPhone ?? req.body.phone;
+  const problemDescription =
+    req.body.problemDescription ?? req.body.notes ?? "";
   if (
-    req.body.preferredDate !== undefined &&
-    Number.isNaN(new Date(req.body.preferredDate).getTime())
+    typeof preferredDateValue !== "string" ||
+    Number.isNaN(new Date(preferredDateValue).getTime())
   ) {
     return res.status(400).send({ message: "preferredDate must be a valid date" });
   }
-  for (const field of ["customerPhone", "address", "problemDescription"]) {
-    if (req.body[field] !== undefined && typeof req.body[field] !== "string") {
-      return res.status(400).send({ message: `${field} must be a string` });
-    }
+  if (typeof req.body.address !== "string" || !req.body.address.trim()) {
+    return res.status(400).send({ message: "address is required" });
+  }
+  if (typeof customerPhone !== "string" || !customerPhone.trim()) {
+    return res.status(400).send({ message: "customerPhone is required" });
+  }
+  if (typeof problemDescription !== "string") {
+    return res.status(400).send({ message: "problemDescription must be a string" });
   }
 
+  const technician = service.technicianEmail
+    ? await userCollection.findOne({
+        email: service.technicianEmail,
+        role: "technician",
+      })
+    : null;
+  const createdAt = new Date();
   const booking = {
+    customerId: customer._id.toString(),
+    customerImage: typeof customer.image === "string" ? customer.image : "",
+    customerArea: typeof customer.area === "string" ? customer.area : "",
     serviceId: service._id.toString(),
     serviceTitle: service.title,
+    serviceDescription:
+      typeof service.description === "string" ? service.description : "",
     serviceImage: service.image,
     category: service.category,
     basePrice: service.basePrice,
     technicianName: service.technicianName,
     technicianEmail: service.technicianEmail,
+    technicianId:
+      technician?._id.toString() ?? service.technicianId ?? "",
+    technicianPhone:
+      typeof technician?.phone === "string"
+        ? technician.phone
+        : typeof service.technicianPhone === "string"
+          ? service.technicianPhone
+          : "",
+    technicianArea:
+      typeof technician?.area === "string"
+        ? technician.area
+        : typeof service.technicianArea === "string"
+          ? service.technicianArea
+          : "",
+    serviceArea: service.serviceArea ?? "",
+    serviceMode: service.serviceMode ?? "",
+    estimatedDuration: service.estimatedDuration ?? "",
     customerName: typeof customer.name === "string" ? customer.name : "",
     customerEmail: customer.email,
-    customerPhone:
-      req.body.customerPhone ??
-      (typeof customer.phone === "string" ? customer.phone : ""),
-    address: req.body.address ?? "",
-    problemDescription: req.body.problemDescription ?? "",
+    customerPhone: customerPhone.trim(),
+    address: req.body.address.trim(),
+    problemDescription: problemDescription.trim(),
     status: "requested",
     finalAmount: service.basePrice,
     paymentStatus: "unpaid",
+    createdAt,
+    updatedAt: createdAt,
   };
-  if (req.body.preferredDate !== undefined) {
-    booking.preferredDate = new Date(req.body.preferredDate);
-  }
+  booking.preferredDate = new Date(preferredDateValue);
 
   const result = await bookingCollection.insertOne(booking);
   res.status(201).send({ ...booking, _id: result.insertedId });
@@ -642,6 +680,7 @@ app.patch("/bookings/:id", async (req, res) => {
   const transitions = technicianUpdate
     ? {
         requested: ["accepted", "rejected"],
+        pending: ["accepted", "rejected"],
         accepted: ["in-progress"],
         "in-progress": ["completed"],
       }
@@ -654,6 +693,9 @@ app.patch("/bookings/:id", async (req, res) => {
   }
 
   const updates = { status: req.body.status };
+  if (req.body.status === "in-progress") {
+    updates.jobStartedAt = booking.jobStartedAt ?? new Date();
+  }
   if (req.body.status === "completed") {
     const finalAmount = req.body.finalAmount ?? booking.basePrice;
     if (
@@ -664,12 +706,860 @@ app.patch("/bookings/:id", async (req, res) => {
       return res.status(400).send({ message: "finalAmount must be a non-negative number" });
     }
     updates.finalAmount = finalAmount;
+    updates.jobCompletedAt = new Date();
   }
+  updates.updatedAt = new Date();
+  const ownershipFilter = technicianUpdate
+    ? { technicianEmail: account.email }
+    : { customerEmail: account.email };
   const result = await bookingCollection.updateOne(
-    { _id: bookingId },
+    { _id: bookingId, status: booking.status, ...ownershipFilter },
     { $set: updates }
   );
+  if (result.matchedCount === 0) {
+    return res.status(409).send({
+      message: "The booking status changed. Refresh and try again.",
+    });
+  }
+  res.send(await bookingCollection.findOne({ _id: bookingId }));
+});
+
+// Admin routes
+const requireAdmin = async (req, res) => {
+  if (!ObjectId.isValid(req.params.adminId)) {
+    res.status(403).send({ message: "Admin access required" });
+    return false;
+  }
+  const admin = await userCollection.findOne({
+    _id: new ObjectId(req.params.adminId),
+    role: "admin",
+  });
+  if (!admin) {
+    res.status(403).send({ message: "Admin access required" });
+    return false;
+  }
+  return true;
+};
+
+const isAllowedQueryStatus = (value, allowedValues) =>
+  value === undefined || allowedValues.includes(value);
+
+const getAdminUser = async (user) => {
+  let profile;
+  if (user.role === "customer" || user.role === "technician") {
+    const roleProfile = roleProfiles[user.role];
+    profile = await roleProfile.collection.findOne({ userId: user._id });
+  }
+  return {
+    ...user,
+    ...(profile || {}),
+    _id: user._id,
+    userId: user._id,
+    ...(profile ? { profileId: profile._id } : {}),
+  };
+};
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const getAdminUserFilters = (query) => {
+  const filter = {};
+  if (query.role !== undefined) {
+    if (!["customer", "technician", "admin"].includes(query.role)) {
+      return null;
+    }
+    filter.role = query.role;
+  }
+  if (query.banned !== undefined) {
+    if (query.banned !== "true" && query.banned !== "false") {
+      return null;
+    }
+    filter.banned = query.banned === "true";
+  }
+  if (query.search !== undefined) {
+    if (typeof query.search !== "string" || query.search.length > 100) {
+      return null;
+    }
+    const search = new RegExp(escapeRegex(query.search), "i");
+    filter.$or = [
+      { name: search },
+      { email: search },
+      { phone: search },
+      { area: search },
+    ];
+  }
+  return filter;
+};
+
+const getAdminUserList = async (filter, query) => {
+  const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit, 10) || 50));
+  const users = await userCollection
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .skip((page - 1) * limit)
+    .limit(limit)
+    .toArray();
+  return {
+    users: await Promise.all(users.map((user) => getAdminUser(user))),
+    page,
+    limit,
+    total: await userCollection.countDocuments(filter),
+  };
+};
+
+const getAdminUserByRole = async (id, role) => {
+  if (!ObjectId.isValid(id)) {
+    return null;
+  }
+  const user = await userCollection.findOne({ _id: new ObjectId(id), role });
+  return user ? getAdminUser(user) : null;
+};
+
+const deleteAdminUser = async (user) => {
+  if (user.role === "customer") {
+    await customerCollection.deleteOne({ userId: user._id });
+  } else if (user.role === "technician") {
+    await technicianCollection.deleteOne({ userId: user._id });
+    await serviceCollection.deleteMany({ technicianEmail: user.email });
+  }
+  await Promise.all([
+    accountCollection.deleteMany({ userId: user._id }),
+    sessionCollection.deleteMany({ userId: user._id }),
+  ]);
+  return userCollection.deleteOne({ _id: user._id });
+};
+
+const getBookingDateFilter = (query, filter) => {
+  if (query.from === undefined && query.to === undefined) {
+    return true;
+  }
+  const dateFilter = {};
+  if (query.from !== undefined) {
+    const from = new Date(query.from);
+    if (Number.isNaN(from.getTime())) return false;
+    dateFilter.$gte = from;
+  }
+  if (query.to !== undefined) {
+    const to = new Date(query.to);
+    if (Number.isNaN(to.getTime())) return false;
+    dateFilter.$lte = to;
+  }
+  filter.preferredDate = dateFilter;
+  return true;
+};
+
+const resolveAdminAccountFilter = async (id, role, field, filter) => {
+  if (id === undefined) return true;
+  if (!ObjectId.isValid(id)) return false;
+  const account = await userCollection.findOne({
+    _id: new ObjectId(id),
+    role,
+  });
+  if (!account) return false;
+  filter[field] = account.email;
+  return true;
+};
+
+app.get("/admin/:adminId/dashboard", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const [totalUsers, customers, technicians, bannedUsers, totalServices,
+    servicesByApproval, totalBookings, bookingsByStatus] = await Promise.all([
+    userCollection.countDocuments({}),
+    userCollection.countDocuments({ role: "customer" }),
+    userCollection.countDocuments({ role: "technician" }),
+    userCollection.countDocuments({ banned: true }),
+    serviceCollection.countDocuments({}),
+    serviceCollection.aggregate([
+      { $group: { _id: "$approvalStatus", count: { $sum: 1 } } },
+    ]).toArray(),
+    bookingCollection.countDocuments({}),
+    bookingCollection.aggregate([
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]).toArray(),
+  ]);
+  const serviceStatusCounts = Object.fromEntries(
+    servicesByApproval.map(({ _id, count }) => [_id || "unknown", count])
+  );
+  const bookingStatusCounts = Object.fromEntries(
+    bookingsByStatus.map(({ _id, count }) => [_id || "unknown", count])
+  );
+  res.send({
+    users: {
+      total: totalUsers,
+      customers,
+      technicians,
+      active: totalUsers - bannedUsers,
+      banned: bannedUsers,
+    },
+    services: {
+      total: totalServices,
+      approvalStatuses: serviceStatusCounts,
+      pending: serviceStatusCounts.pending || 0,
+      approved: serviceStatusCounts.approved || 0,
+      rejected: serviceStatusCounts.rejected || 0,
+    },
+    bookings: {
+      total: totalBookings,
+      statuses: bookingStatusCounts,
+      completed: bookingStatusCounts.completed || 0,
+      pending:
+        (bookingStatusCounts.requested || 0) +
+        (bookingStatusCounts.accepted || 0) +
+        (bookingStatusCounts["in-progress"] || 0),
+      rejected: bookingStatusCounts.rejected || 0,
+      cancelled: bookingStatusCounts.cancelled || 0,
+    },
+    payments: {
+      available: false,
+      message: "Payment statistics are available after payment integration.",
+    },
+  });
+});
+
+app.get("/admin/:adminId/users", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const filter = getAdminUserFilters(req.query);
+  if (!filter) {
+    return res.status(400).send({ message: "Invalid user filter" });
+  }
+  res.send(await getAdminUserList(filter, req.query));
+});
+
+app.get("/admin/:adminId/users/:userId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.userId)) {
+    return res.status(400).send({ message: "Invalid user ID" });
+  }
+  const user = await userCollection.findOne({
+    _id: new ObjectId(req.params.userId),
+  });
+  if (!user) return res.status(404).send({ message: "User not found" });
+  res.send(await getAdminUser(user));
+});
+
+app.patch("/admin/:adminId/users/:userId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.userId)) {
+    return res.status(400).send({ message: "Invalid user ID" });
+  }
+  if (req.body.role !== undefined || req.body.email !== undefined) {
+    return res.status(400).send({
+      message: "Email and role changes must use the authentication management APIs",
+    });
+  }
+  const userId = new ObjectId(req.params.userId);
+  const user = await userCollection.findOne({ _id: userId });
+  if (!user) return res.status(404).send({ message: "User not found" });
+
+  const userUpdates = {};
+  const profileUpdates = {};
+  for (const field of ["name", "image", "phone", "area", "bio"]) {
+    if (req.body[field] !== undefined) {
+      if (typeof req.body[field] !== "string") {
+        return res.status(400).send({ message: `${field} must be a string` });
+      }
+      userUpdates[field] = req.body[field];
+    }
+  }
+  if (req.body.banned !== undefined) {
+    if (typeof req.body.banned !== "boolean") {
+      return res.status(400).send({ message: "banned must be a boolean" });
+    }
+    userUpdates.banned = req.body.banned;
+  }
+  if (req.body.emailVerified !== undefined) {
+    if (typeof req.body.emailVerified !== "boolean") {
+      return res.status(400).send({ message: "emailVerified must be a boolean" });
+    }
+    userUpdates.emailVerified = req.body.emailVerified;
+  }
+  const roleProfile = roleProfiles[user.role];
+  if (roleProfile) {
+    for (const [field, value] of Object.entries(roleProfile.fields)) {
+      if (req.body[field] === undefined) continue;
+      if (Array.isArray(value) && !Array.isArray(req.body[field])) {
+        return res.status(400).send({ message: `${field} must be an array` });
+      }
+      if (field === "experience" && typeof req.body[field] !== "number") {
+        return res.status(400).send({ message: "experience must be a number" });
+      }
+      if (
+        field === "availability" &&
+        (req.body[field] === null ||
+          typeof req.body[field] !== "object" ||
+          Array.isArray(req.body[field]))
+      ) {
+        return res.status(400).send({ message: "availability must be an object" });
+      }
+      profileUpdates[field] = req.body[field];
+    }
+  }
+  if (
+    Object.keys(userUpdates).length === 0 &&
+    Object.keys(profileUpdates).length === 0
+  ) {
+    return res.status(400).send({ message: "No user fields to update" });
+  }
+  if (Object.keys(userUpdates).length > 0) {
+    userUpdates.updatedAt = new Date();
+    await userCollection.updateOne({ _id: userId }, { $set: userUpdates });
+  }
+  if (Object.keys(profileUpdates).length > 0) {
+    await roleProfile.collection.updateOne(
+      { userId },
+      { $set: { ...profileUpdates, updatedAt: new Date() } },
+      { upsert: true }
+    );
+  }
+  const refreshedUser = await userCollection.findOne({ _id: userId });
+  res.send(await getAdminUser(refreshedUser));
+});
+
+app.patch("/admin/:adminId/users/:userId/ban", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.userId)) {
+    return res.status(400).send({ message: "Invalid user ID" });
+  }
+  if (typeof req.body.banned !== "boolean") {
+    return res.status(400).send({ message: "banned must be a boolean" });
+  }
+  const result = await userCollection.updateOne(
+    { _id: new ObjectId(req.params.userId) },
+    { $set: { banned: req.body.banned, updatedAt: new Date() } }
+  );
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "User not found" });
+  }
   res.send(result);
+});
+
+app.delete("/admin/:adminId/users/:userId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.userId)) {
+    return res.status(400).send({ message: "Invalid user ID" });
+  }
+  const user = await userCollection.findOne({
+    _id: new ObjectId(req.params.userId),
+  });
+  if (!user) return res.status(404).send({ message: "User not found" });
+  res.send(await deleteAdminUser(user));
+});
+
+app.get("/admin/:adminId/users/:userId/activity", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.userId)) {
+    return res.status(400).send({ message: "Invalid user ID" });
+  }
+  const user = await userCollection.findOne({
+    _id: new ObjectId(req.params.userId),
+  });
+  if (!user) return res.status(404).send({ message: "User not found" });
+  const [bookings, services] = await Promise.all([
+    user.role === "customer"
+      ? bookingCollection.find({ customerEmail: user.email }).toArray()
+      : user.role === "technician"
+        ? bookingCollection.find({ technicianEmail: user.email }).toArray()
+        : [],
+    user.role === "technician"
+      ? serviceCollection.find({ technicianEmail: user.email }).toArray()
+      : [],
+  ]);
+  res.send({
+    user: await getAdminUser(user),
+    services,
+    bookings,
+    bookingCount: bookings.length,
+    completedBookingCount: bookings.filter((booking) => booking.status === "completed").length,
+  });
+});
+
+app.get("/admin/:adminId/customers", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  res.send(await getAdminUserList({ role: "customer" }, req.query));
+});
+
+app.get("/admin/:adminId/customers/:customerId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const customer = await getAdminUserByRole(req.params.customerId, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  const bookings = await bookingCollection
+    .find({ customerEmail: customer.email })
+    .sort({ preferredDate: -1 })
+    .toArray();
+  res.send({
+    ...customer,
+    bookings,
+    bookingCount: bookings.length,
+    completedBookingCount: bookings.filter((booking) => booking.status === "completed").length,
+  });
+});
+
+app.patch("/admin/:adminId/customers/:customerId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const customer = await getAdminUserByRole(req.params.customerId, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  const userId = new ObjectId(customer._id);
+  const updates = {};
+  for (const field of ["name", "image", "phone", "area", "bio"]) {
+    if (req.body[field] !== undefined) {
+      if (typeof req.body[field] !== "string") {
+        return res.status(400).send({ message: `${field} must be a string` });
+      }
+      updates[field] = req.body[field];
+    }
+  }
+  if (req.body.banned !== undefined) {
+    if (typeof req.body.banned !== "boolean") {
+      return res.status(400).send({ message: "banned must be a boolean" });
+    }
+    updates.banned = req.body.banned;
+  }
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).send({ message: "No customer fields to update" });
+  }
+  updates.updatedAt = new Date();
+  await userCollection.updateOne({ _id: userId }, { $set: updates });
+  const updated = await userCollection.findOne({ _id: userId });
+  res.send(await getAdminUser(updated));
+});
+
+app.delete("/admin/:adminId/customers/:customerId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const customer = await getAdminUserByRole(req.params.customerId, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  res.send(await deleteAdminUser({ ...customer, role: "customer" }));
+});
+
+app.get("/admin/:adminId/customers/:customerId/bookings", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const customer = await getAdminUserByRole(req.params.customerId, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  res.send(await bookingCollection.find({ customerEmail: customer.email }).toArray());
+});
+
+app.get("/admin/:adminId/technicians", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  res.send(await getAdminUserList({ role: "technician" }, req.query));
+});
+
+app.get("/admin/:adminId/technicians/:technicianId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const technician = await getAdminUserByRole(req.params.technicianId, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  const [services, bookings] = await Promise.all([
+    serviceCollection.find({ technicianEmail: technician.email }).toArray(),
+    bookingCollection.find({ technicianEmail: technician.email }).toArray(),
+  ]);
+  res.send({
+    ...technician,
+    services,
+    bookings,
+    serviceCount: services.length,
+    bookingCount: bookings.length,
+    completedBookingCount: bookings.filter((booking) => booking.status === "completed").length,
+    pendingBookingCount: bookings.filter((booking) =>
+      ["requested", "accepted", "in-progress"].includes(booking.status)
+    ).length,
+    rejectedBookingCount: bookings.filter((booking) => booking.status === "rejected").length,
+  });
+});
+
+app.patch("/admin/:adminId/technicians/:technicianId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const technician = await getAdminUserByRole(req.params.technicianId, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  const userId = new ObjectId(technician._id);
+  const userUpdates = {};
+  const profileUpdates = {};
+  for (const field of ["name", "image", "phone", "area", "bio"]) {
+    if (req.body[field] !== undefined) {
+      if (typeof req.body[field] !== "string") {
+        return res.status(400).send({ message: `${field} must be a string` });
+      }
+      userUpdates[field] = req.body[field];
+    }
+  }
+  if (req.body.banned !== undefined) {
+    if (typeof req.body.banned !== "boolean") {
+      return res.status(400).send({ message: "banned must be a boolean" });
+    }
+    userUpdates.banned = req.body.banned;
+  }
+  for (const field of ["skills", "experience", "serviceCategories", "availability"]) {
+    if (req.body[field] === undefined) continue;
+    if (
+      ["skills", "serviceCategories"].includes(field) &&
+      !Array.isArray(req.body[field])
+    ) {
+      return res.status(400).send({ message: `${field} must be an array` });
+    }
+    if (field === "experience" && typeof req.body[field] !== "number") {
+      return res.status(400).send({ message: "experience must be a number" });
+    }
+    if (
+      field === "availability" &&
+      (req.body[field] === null ||
+        typeof req.body[field] !== "object" ||
+        Array.isArray(req.body[field]))
+    ) {
+      return res.status(400).send({ message: "availability must be an object" });
+    }
+    profileUpdates[field] = req.body[field];
+  }
+  if (Object.keys(userUpdates).length === 0 && Object.keys(profileUpdates).length === 0) {
+    return res.status(400).send({ message: "No technician fields to update" });
+  }
+  if (Object.keys(userUpdates).length > 0) {
+    userUpdates.updatedAt = new Date();
+    await userCollection.updateOne({ _id: userId }, { $set: userUpdates });
+  }
+  if (Object.keys(profileUpdates).length > 0) {
+    await technicianCollection.updateOne(
+      { userId },
+      { $set: { ...profileUpdates, updatedAt: new Date() } },
+      { upsert: true }
+    );
+  }
+  res.send(await getAdminUser(await userCollection.findOne({ _id: userId })));
+});
+
+app.delete("/admin/:adminId/technicians/:technicianId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const technician = await getAdminUserByRole(req.params.technicianId, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  res.send(await deleteAdminUser({ ...technician, role: "technician" }));
+});
+
+app.get("/admin/:adminId/technicians/:technicianId/services", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const technician = await getAdminUserByRole(req.params.technicianId, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  res.send(await serviceCollection.find({ technicianEmail: technician.email }).toArray());
+});
+
+app.get("/admin/:adminId/technicians/:technicianId/bookings", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const technician = await getAdminUserByRole(req.params.technicianId, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  res.send(await bookingCollection.find({ technicianEmail: technician.email }).toArray());
+});
+
+app.get("/admin/:adminId/services/pending", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  res.send(await serviceCollection.find({ approvalStatus: "pending" }).toArray());
+});
+
+app.get("/admin/:adminId/services", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!isAllowedQueryStatus(req.query.approvalStatus, approvalStatuses)) {
+    return res.status(400).send({ message: "Invalid approvalStatus" });
+  }
+  const filter = {};
+  for (const field of ["category", "approvalStatus"]) {
+    if (req.query[field] !== undefined) filter[field] = req.query[field];
+  }
+  if (req.query.isAvailable !== undefined) {
+    if (req.query.isAvailable !== "true" && req.query.isAvailable !== "false") {
+      return res.status(400).send({ message: "isAvailable must be true or false" });
+    }
+    filter.isAvailable = req.query.isAvailable === "true";
+  }
+  if (
+    !(await resolveAdminAccountFilter(
+      req.query.technicianId,
+      "technician",
+      "technicianEmail",
+      filter
+    ))
+  ) {
+    return res.status(400).send({ message: "Invalid technicianId" });
+  }
+  res.send(await serviceCollection.find(filter).sort({ createdAt: -1 }).toArray());
+});
+
+app.get("/admin/:adminId/services/:serviceId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.serviceId)) {
+    return res.status(400).send({ message: "Invalid service ID" });
+  }
+  const service = await serviceCollection.findOne({
+    _id: new ObjectId(req.params.serviceId),
+  });
+  if (!service) return res.status(404).send({ message: "Service not found" });
+  const bookings = await bookingCollection.find({ serviceId: service._id.toString() }).toArray();
+  res.send({ ...service, bookings, bookingCount: bookings.length });
+});
+
+app.patch("/admin/:adminId/services/:serviceId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.serviceId)) {
+    return res.status(400).send({ message: "Invalid service ID" });
+  }
+  const updates = {};
+  for (const field of serviceFields) {
+    if (req.body[field] !== undefined) {
+      if (field === "basePrice") {
+        if (
+          typeof req.body[field] !== "number" ||
+          !Number.isFinite(req.body[field]) ||
+          req.body[field] < 0
+        ) {
+          return res.status(400).send({ message: "basePrice must be a non-negative number" });
+        }
+      } else if (typeof req.body[field] !== "string") {
+        return res.status(400).send({ message: `${field} must be a string` });
+      }
+      updates[field] = req.body[field];
+    }
+  }
+  if (req.body.approvalStatus !== undefined) {
+    if (!approvalStatuses.includes(req.body.approvalStatus)) {
+      return res.status(400).send({ message: "Invalid approvalStatus" });
+    }
+    updates.approvalStatus = req.body.approvalStatus;
+  }
+  if (req.body.isAvailable !== undefined) {
+    if (typeof req.body.isAvailable !== "boolean") {
+      return res.status(400).send({ message: "isAvailable must be a boolean" });
+    }
+    updates.isAvailable = req.body.isAvailable;
+  }
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).send({ message: "No service fields to update" });
+  }
+  const result = await serviceCollection.updateOne(
+    { _id: new ObjectId(req.params.serviceId) },
+    { $set: updates }
+  );
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "Service not found" });
+  }
+  res.send(result);
+});
+
+app.patch("/admin/:adminId/services/:serviceId/approval", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.serviceId)) {
+    return res.status(400).send({ message: "Invalid service ID" });
+  }
+  if (!approvalStatuses.includes(req.body.approvalStatus)) {
+    return res.status(400).send({ message: "Invalid approvalStatus" });
+  }
+  const result = await serviceCollection.updateOne(
+    { _id: new ObjectId(req.params.serviceId) },
+    { $set: { approvalStatus: req.body.approvalStatus } }
+  );
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "Service not found" });
+  }
+  res.send(result);
+});
+
+app.delete("/admin/:adminId/services/:serviceId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.serviceId)) {
+    return res.status(400).send({ message: "Invalid service ID" });
+  }
+  const result = await serviceCollection.deleteOne({
+    _id: new ObjectId(req.params.serviceId),
+  });
+  if (result.deletedCount === 0) {
+    return res.status(404).send({ message: "Service not found" });
+  }
+  res.send(result);
+});
+
+app.get("/admin/:adminId/bookings", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!isAllowedQueryStatus(req.query.status, bookingStatuses)) {
+    return res.status(400).send({ message: "Invalid booking status" });
+  }
+  const filter = {};
+  if (req.query.status !== undefined) filter.status = req.query.status;
+  if (!getBookingDateFilter(req.query, filter)) {
+    return res.status(400).send({ message: "Invalid booking date range" });
+  }
+  if (
+    !(await resolveAdminAccountFilter(
+      req.query.customerId,
+      "customer",
+      "customerEmail",
+      filter
+    )) ||
+    !(await resolveAdminAccountFilter(
+      req.query.technicianId,
+      "technician",
+      "technicianEmail",
+      filter
+    ))
+  ) {
+    return res.status(400).send({ message: "Invalid customerId or technicianId" });
+  }
+  res.send(await bookingCollection.find(filter).sort({ preferredDate: -1 }).toArray());
+});
+
+app.get("/admin/:adminId/bookings/:bookingId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.bookingId)) {
+    return res.status(400).send({ message: "Invalid booking ID" });
+  }
+  const booking = await bookingCollection.findOne({
+    _id: new ObjectId(req.params.bookingId),
+  });
+  if (!booking) return res.status(404).send({ message: "Booking not found" });
+  const [customer, technician] = await Promise.all([
+    userCollection.findOne({ email: booking.customerEmail, role: "customer" }),
+    userCollection.findOne({ email: booking.technicianEmail, role: "technician" }),
+  ]);
+  res.send({
+    ...booking,
+    customer: customer ? await getAdminUser(customer) : null,
+    technician: technician ? await getAdminUser(technician) : null,
+  });
+});
+
+app.patch("/admin/:adminId/bookings/:bookingId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  if (!ObjectId.isValid(req.params.bookingId)) {
+    return res.status(400).send({ message: "Invalid booking ID" });
+  }
+  const updates = {};
+  for (const field of ["customerPhone", "address", "problemDescription"]) {
+    if (req.body[field] !== undefined) {
+      if (typeof req.body[field] !== "string") {
+        return res.status(400).send({ message: `${field} must be a string` });
+      }
+      updates[field] = req.body[field];
+    }
+  }
+  if (req.body.preferredDate !== undefined) {
+    const preferredDate = new Date(req.body.preferredDate);
+    if (Number.isNaN(preferredDate.getTime())) {
+      return res.status(400).send({ message: "preferredDate must be a valid date" });
+    }
+    updates.preferredDate = preferredDate;
+  }
+  if (req.body.status !== undefined) {
+    if (!bookingStatuses.includes(req.body.status)) {
+      return res.status(400).send({ message: "Invalid booking status" });
+    }
+    updates.status = req.body.status;
+  }
+  if (req.body.finalAmount !== undefined) {
+    if (
+      typeof req.body.finalAmount !== "number" ||
+      !Number.isFinite(req.body.finalAmount) ||
+      req.body.finalAmount < 0
+    ) {
+      return res.status(400).send({ message: "finalAmount must be a non-negative number" });
+    }
+    updates.finalAmount = req.body.finalAmount;
+  }
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).send({ message: "No booking fields to update" });
+  }
+  const result = await bookingCollection.updateOne(
+    { _id: new ObjectId(req.params.bookingId) },
+    { $set: updates }
+  );
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "Booking not found" });
+  }
+  res.send(result);
+});
+
+app.get("/admin/:adminId/reports", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const [technicianBookings, customerBookings, popularServices, categoryServices,
+    categoryBookings, bookingStatuses, technicianServices] = await Promise.all([
+    bookingCollection.aggregate([
+      {
+        $group: {
+          _id: "$technicianEmail",
+          bookingCount: { $sum: 1 },
+          completedBookingCount: {
+            $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+          },
+          rejectedBookingCount: {
+            $sum: { $cond: [{ $eq: ["$status", "rejected"] }, 1, 0] },
+          },
+        },
+      },
+      { $sort: { bookingCount: -1 } },
+      { $limit: 10 },
+    ]).toArray(),
+    bookingCollection.aggregate([
+      {
+        $group: {
+          _id: "$customerEmail",
+          bookingCount: { $sum: 1 },
+          completedBookingCount: {
+            $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+          },
+        },
+      },
+      { $sort: { bookingCount: -1 } },
+      { $limit: 10 },
+    ]).toArray(),
+    bookingCollection.aggregate([
+      {
+        $group: {
+          _id: "$serviceId",
+          serviceTitle: { $first: "$serviceTitle" },
+          category: { $first: "$category" },
+          bookingCount: { $sum: 1 },
+        },
+      },
+      { $sort: { bookingCount: -1 } },
+      { $limit: 10 },
+    ]).toArray(),
+    serviceCollection.aggregate([
+      { $group: { _id: "$category", serviceCount: { $sum: 1 } } },
+      { $sort: { serviceCount: -1 } },
+    ]).toArray(),
+    bookingCollection.aggregate([
+      { $group: { _id: "$category", bookingCount: { $sum: 1 } } },
+      { $sort: { bookingCount: -1 } },
+    ]).toArray(),
+    bookingCollection.aggregate([
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]).toArray(),
+    serviceCollection.aggregate([
+      {
+        $group: {
+          _id: "$technicianEmail",
+          serviceCount: { $sum: 1 },
+        },
+      },
+      { $sort: { serviceCount: -1 } },
+      { $limit: 10 },
+    ]).toArray(),
+  ]);
+  res.send({
+    mostActiveTechnicians: technicianBookings,
+    mostActiveCustomers: customerBookings,
+    mostBookedServices: popularServices,
+    technicianServiceCounts: technicianServices,
+    categoryServiceCounts: categoryServices,
+    categoryBookingCounts: categoryBookings,
+    bookingStatuses: Object.fromEntries(
+      bookingStatuses.map(({ _id, count }) => [_id || "unknown", count])
+    ),
+  });
+});
+
+app.get("/admin/:adminId/payments", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  res.status(501).send({
+    message: "Payment records are unavailable until payment integration is implemented.",
+  });
+});
+
+app.get("/admin/:adminId/payments/:paymentId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  res.status(501).send({
+    message: "Payment records are unavailable until payment integration is implemented.",
+  });
 });
 
 // Other routes
