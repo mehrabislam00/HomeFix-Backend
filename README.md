@@ -43,6 +43,10 @@ Use the client repository with this backend to run the complete application. The
 - **Security:** HMAC session signatures and timing-safe signature verification
 - **Deployment:** Vercel
 
+The MongoDB client is shared per warm serverless instance and uses a bounded
+connection pool. `GET /health` checks database reachability; `GET /` is only a
+process liveness response.
+
 ## Project Structure
 
 ```text
@@ -83,6 +87,7 @@ Create a `.env` file in the project root:
 
 ```env
 PORT=5000
+MONGODB_URI=
 MONGODB_USERNAME=your_mongodb_username
 MONGODB_PASSWORD=your_mongodb_password
 
@@ -123,8 +128,9 @@ http://localhost:5000
 | Variable | Description |
 | --- | --- |
 | `PORT` | HTTP port. Defaults to `5000`. |
-| `MONGODB_USERNAME` | MongoDB Atlas database username. |
-| `MONGODB_PASSWORD` | MongoDB Atlas database password. |
+| `MONGODB_URI` | Optional MongoDB connection URI. When set, the backend uses this topology. |
+| `MONGODB_USERNAME` | MongoDB Atlas database username; required with `MONGODB_PASSWORD` when `MONGODB_URI` is unset, or used as URI auth when its URI has no credentials. |
+| `MONGODB_PASSWORD` | MongoDB Atlas database password; required with `MONGODB_USERNAME` when `MONGODB_URI` is unset, or used as URI auth when its URI has no credentials. |
 | `BETTER_AUTH_SECRET` | Secret shared with the Better Auth client server. Used to verify signed session cookies. |
 | `JWT_SECRET` | Random secret of at least 32 characters used to sign API access tokens. |
 | `HOMEFIX_PAYMENT_API_SECRET` | Shared secret used for protected notification API requests. |

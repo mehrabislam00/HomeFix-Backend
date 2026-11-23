@@ -1,5 +1,13 @@
 import express from "express";
-import { MongoClient, ObjectId } from "mongodb";
+import {
+  MongoClient,
+  MongoNetworkError,
+  MongoOperationTimeoutError,
+  MongoServerClosedError,
+  MongoServerSelectionError,
+  MongoTopologyClosedError,
+  ObjectId,
+} from "mongodb";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { SignJWT, jwtVerify } from "jose";
 import Stripe from "stripe";
@@ -23,15 +31,43 @@ app.use(cors());
 
 // MongoDB connection
 
-const client = new MongoClient(`mongodb://${process.env.MONGODB_USERNAME}:${process.env.MONGODB_PASSWORD}@ac-asbrkvt-shard-00-00.i2pehxb.mongodb.net:27017,ac-asbrkvt-shard-00-01.i2pehxb.mongodb.net:27017,ac-asbrkvt-shard-00-02.i2pehxb.mongodb.net:27017/?ssl=true&replicaSet=atlas-946ygn-shard-0&authSource=admin`);
-export async function connectToMongoDB() {
-  await client.connect();
-  console.log("You successfully connected to MongoDB!");
-  return client;
+const mongoUri = process.env.MONGODB_URI?.trim();
+const mongoUsername = process.env.MONGODB_USERNAME;
+const mongoPassword = process.env.MONGODB_PASSWORD;
+
+if (!mongoUri && (!mongoUsername || !mongoPassword)) {
+  throw new Error(
+    "Configure MONGODB_URI or both MONGODB_USERNAME and MONGODB_PASSWORD."
+  );
 }
 
-// Connect once at startup
-await connectToMongoDB();
+const connectionString =
+  mongoUri ||
+  `mongodb://${encodeURIComponent(mongoUsername)}:${encodeURIComponent(mongoPassword)}@ac-asbrkvt-shard-00-00.i2pehxb.mongodb.net:27017,ac-asbrkvt-shard-00-01.i2pehxb.mongodb.net:27017,ac-asbrkvt-shard-00-02.i2pehxb.mongodb.net:27017/?ssl=true&replicaSet=atlas-946ygn-shard-0&authSource=admin`;
+const uriHasCredentials =
+  /^[a-z][a-z\d+.-]*:\/\/[^/]*@/i.test(connectionString);
+if (!uriHasCredentials && (!mongoUsername || !mongoPassword)) {
+  throw new Error(
+    "Configure MongoDB URI credentials or both MONGODB_USERNAME and MONGODB_PASSWORD."
+  );
+}
+const mongoOptions = {
+  maxPoolSize: 5,
+  maxConnecting: 2,
+  minPoolSize: 0,
+  maxIdleTimeMS: 60_000,
+  serverSelectionTimeoutMS: 8_000,
+  connectTimeoutMS: 8_000,
+};
+if (!uriHasCredentials) {
+  mongoOptions.auth = { username: mongoUsername, password: mongoPassword };
+}
+
+const globalForMongo = globalThis;
+const client =
+  globalForMongo.homeFixBackendMongoClient ||
+  new MongoClient(connectionString, mongoOptions);
+globalForMongo.homeFixBackendMongoClient = client;
 const database = client.db("HomeFix_DB");
 const userCollection = database.collection("user");
 const accountCollection = database.collection("account");
@@ -130,44 +166,74 @@ const commonUserDefaults = {
 };
 const commonUserFields = [...Object.keys(commonUserDefaults), "createdAt", "updatedAt"];
 
-await Promise.all([
-  customerCollection.createIndex({ userId: 1 }, { unique: true }),
-  technicianCollection.createIndex({ userId: 1 }, { unique: true }),
-  paymentCollection.createIndex(
-    { bookingId: 1 },
-    { unique: true, partialFilterExpression: { bookingId: { $type: "string" } } }
-  ),
-  paymentCollection.createIndex(
-    { stripeSessionId: 1 },
-    {
-      unique: true,
-      partialFilterExpression: { stripeSessionId: { $type: "string" } },
-    }
-  ),
-  paymentCollection.createIndex(
-    { transactionId: 1 },
-    {
-      unique: true,
-      partialFilterExpression: { transactionId: { $type: "string" } },
-    }
-  ),
-  paymentCollection.createIndex({ customerEmail: 1, paidAt: -1 }),
-  paymentCollection.createIndex({ technicianEmail: 1, paidAt: -1 }),
-  paymentCollection.createIndex({ customerId: 1, paidAt: -1 }),
-  paymentCollection.createIndex({ technicianId: 1, paidAt: -1 }),
-  notificationCollection.createIndex(
-    { recipientId: 1, recipientRole: 1, createdAt: -1 },
-    { name: "notification_recipient_created" }
-  ),
-  notificationCollection.createIndex(
-    { dedupeKey: 1 },
-    {
-      name: "notification_dedupe",
-      unique: true,
-      partialFilterExpression: { dedupeKey: { $type: "string" } },
-    }
-  ),
-]);
+const initializeIndexes = () =>
+  Promise.all([
+    customerCollection.createIndex({ userId: 1 }, { unique: true }),
+    technicianCollection.createIndex({ userId: 1 }, { unique: true }),
+    paymentCollection.createIndex(
+      { bookingId: 1 },
+      { unique: true, partialFilterExpression: { bookingId: { $type: "string" } } }
+    ),
+    paymentCollection.createIndex(
+      { stripeSessionId: 1 },
+      {
+        unique: true,
+        partialFilterExpression: { stripeSessionId: { $type: "string" } },
+      }
+    ),
+    paymentCollection.createIndex(
+      { transactionId: 1 },
+      {
+        unique: true,
+        partialFilterExpression: { transactionId: { $type: "string" } },
+      }
+    ),
+    paymentCollection.createIndex({ customerEmail: 1, paidAt: -1 }),
+    paymentCollection.createIndex({ technicianEmail: 1, paidAt: -1 }),
+    paymentCollection.createIndex({ customerId: 1, paidAt: -1 }),
+    paymentCollection.createIndex({ technicianId: 1, paidAt: -1 }),
+    notificationCollection.createIndex(
+      { recipientId: 1, recipientRole: 1, createdAt: -1 },
+      { name: "notification_recipient_created" }
+    ),
+    notificationCollection.createIndex(
+      { dedupeKey: 1 },
+      {
+        name: "notification_dedupe",
+        unique: true,
+        partialFilterExpression: { dedupeKey: { $type: "string" } },
+      }
+    ),
+  ]);
+
+let databaseReady;
+export async function connectToMongoDB() {
+  if (!databaseReady) {
+    databaseReady = (async () => {
+      await client.connect();
+      await initializeIndexes();
+      console.log("You successfully connected to MongoDB!");
+      return client;
+    })().catch((error) => {
+      databaseReady = undefined;
+      throw error;
+    });
+  }
+  return databaseReady;
+}
+
+app.use(async (req, res, next) => {
+  if (req.method === "OPTIONS" || req.path === "/" || req.path === "/health") {
+    return next();
+  }
+  try {
+    await connectToMongoDB();
+    return next();
+  } catch (error) {
+    console.error("MongoDB initialization failed.", error);
+    return res.status(503).send({ message: "Database temporarily unavailable." });
+  }
+});
 
 const createNotification = async (
   recipientId,
@@ -347,8 +413,14 @@ const watchUserRegistrations = async () => {
   }
 };
 
-void watchUserRegistrations();
-await syncExistingRoleProfiles();
+if (process.env.VERCEL !== "1") {
+  void connectToMongoDB()
+    .then(syncExistingRoleProfiles)
+    .then(watchUserRegistrations)
+    .catch((error) => {
+      console.error("Local database synchronization failed.", error);
+    });
+}
 
 // Authentication routes
 // Better Auth authentication endpoints are managed by the existing auth service.
@@ -667,6 +739,7 @@ const issueAccessToken = async (req, res) => {
   if (!["customer", "technician", "admin"].includes(authSession.user.role)) {
     return res.status(403).send({ message: "Account role is unavailable" });
   }
+  await syncRoleProfile(authSession.user);
   res.send({
     accessToken: await createAccessToken(authSession.user, authSession.session),
     tokenType: "Bearer",
@@ -781,6 +854,30 @@ const serializeNotification = (notification) => ({
   recipientId: notification.recipientId.toString(),
   createdAt: notification.createdAt.toISOString(),
   readAt: notification.readAt?.toISOString() ?? null,
+});
+
+app.post("/notifications/user-registered", async (req, res) => {
+  if (!requireNotificationApiSecret(req, res)) return;
+  const userId = req.body?.userId;
+  if (typeof userId !== "string" || !ObjectId.isValid(userId)) {
+    return res.status(400).send({ message: "Invalid user ID" });
+  }
+  const user = await userCollection.findOne({
+    _id: new ObjectId(userId),
+    role: { $in: ["customer", "technician"] },
+  });
+  if (!user) {
+    return res.status(404).send({ message: "Notification recipient not found" });
+  }
+  await notifyAdmins({
+    type: "user_registered",
+    title: `New ${user.role} registered`,
+    message: `${user.name || "A new user"} joined HomeFix as a ${user.role}.`,
+    relatedId: user._id.toString(),
+    href: "/admin-dashboard/users",
+    dedupeKey: `user-registered:${user._id}`,
+  });
+  res.status(202).send({ ok: true });
 });
 
 app.get("/notifications/:role/:userId", async (req, res) => {
@@ -3297,15 +3394,46 @@ app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-
-// Start the server
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
-  if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
-    console.error(
-      "Stripe payment verification is disabled: configure STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET in the backend environment."
-    );
+app.get("/health", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    await connectToMongoDB();
+    await database.command({ ping: 1 });
+    res.status(200).send({ status: "ok", database: "reachable" });
+  } catch (error) {
+    console.error("Backend database health check failed.", error);
+    res.status(503).send({ status: "unavailable", database: "unreachable" });
   }
 });
+
+app.use((error, req, res, next) => {
+  console.error("Unhandled API request error.", error);
+  if (res.headersSent) return next(error);
+  const isTransientDatabaseError =
+    error instanceof MongoNetworkError ||
+    error instanceof MongoOperationTimeoutError ||
+    error instanceof MongoServerClosedError ||
+    error instanceof MongoServerSelectionError ||
+    error instanceof MongoTopologyClosedError;
+  return res
+    .status(isTransientDatabaseError ? 503 : 500)
+    .send({
+      message: isTransientDatabaseError
+        ? "Database temporarily unavailable."
+        : "Internal server error.",
+    });
+});
+
+// Start the server
+if (process.env.VERCEL !== "1") {
+  app.listen(port, () => {
+    console.log(`Example app listening on port ${port}`);
+    if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
+      console.error(
+        "Stripe payment verification is disabled: configure STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET in the backend environment."
+      );
+    }
+  });
+}
 
 export default app;
