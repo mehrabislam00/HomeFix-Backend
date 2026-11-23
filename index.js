@@ -1,12 +1,23 @@
 import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import Stripe from "stripe";
 import "dotenv/config";
 import cors from "cors";
 const app = express();
 const port = process.env.PORT || 5000;
 
 // Middleware
-app.use(express.json({ limit: "8mb" }));
+app.use(
+  express.json({
+    limit: "8mb",
+    verify: (req, res, buffer) => {
+      if (req.originalUrl.split("?")[0] === "/webhooks/stripe") {
+        req.rawBody = Buffer.from(buffer);
+      }
+    },
+  })
+);
 app.use(cors());
 
 // MongoDB connection
@@ -28,6 +39,35 @@ const customerCollection = database.collection("customers");
 const technicianCollection = database.collection("technicians");
 const serviceCollection = database.collection("services");
 const bookingCollection = database.collection("bookings");
+const paymentCollection = database.collection("payments");
+const notificationCollection = database.collection("notifications");
+const notificationRoles = ["customer", "technician", "admin"];
+const notificationTypes = [
+  "user_registered",
+  "booking_created",
+  "booking_updated",
+  "booking_cancelled",
+  "service_submitted",
+  "service_decision",
+  "service_removed",
+  "account_update",
+  "payment_processing",
+  "payment_completed",
+  "payment_issue",
+];
+
+const requireNotificationApiSecret = (req, res) => {
+  const secret = process.env.HOMEFIX_PAYMENT_API_SECRET;
+  if (!secret) {
+    res.status(503).send({ message: "Notification API is not configured" });
+    return false;
+  }
+  if (req.headers["x-homefix-notification-secret"] !== secret) {
+    res.status(401).send({ message: "Unauthorized notification request" });
+    return false;
+  }
+  return true;
+};
 const roleProfiles = {
   customer: {
     collection: customerCollection,
@@ -45,6 +85,38 @@ const roleProfiles = {
     removeFields: ["address"],
   },
 };
+
+const notifyCompletedPayment = async (booking, paymentId, stripeSessionId, session) => {
+  const paymentHref = {
+    customer: "/customer-dashboard/payments",
+    technician: "/technician-dashboard/payments",
+    admin: "/admin-dashboard/transactions",
+  };
+  const notification = (role) => ({
+    type: "payment_completed",
+    title: "Payment completed",
+    message: `Payment for ${booking.serviceTitle} was verified successfully.`,
+    relatedId: paymentId || booking._id.toString(),
+    href: paymentHref[role],
+    dedupeKey: `payment-completed:${stripeSessionId}`,
+  });
+  await Promise.all([
+    createNotification(
+      booking.customerId,
+      "customer",
+      notification("customer"),
+      session
+    ),
+    createNotification(
+      booking.technicianId,
+      "technician",
+      notification("technician"),
+      session
+    ),
+    notifyAdmins(notification("admin"), session),
+  ]);
+};
+
 const commonUserDefaults = {
   name: "",
   email: "",
@@ -60,7 +132,120 @@ const commonUserFields = [...Object.keys(commonUserDefaults), "createdAt", "upda
 await Promise.all([
   customerCollection.createIndex({ userId: 1 }, { unique: true }),
   technicianCollection.createIndex({ userId: 1 }, { unique: true }),
+  paymentCollection.createIndex(
+    { bookingId: 1 },
+    { unique: true, partialFilterExpression: { bookingId: { $type: "string" } } }
+  ),
+  paymentCollection.createIndex(
+    { stripeSessionId: 1 },
+    {
+      unique: true,
+      partialFilterExpression: { stripeSessionId: { $type: "string" } },
+    }
+  ),
+  paymentCollection.createIndex(
+    { transactionId: 1 },
+    {
+      unique: true,
+      partialFilterExpression: { transactionId: { $type: "string" } },
+    }
+  ),
+  paymentCollection.createIndex({ customerEmail: 1, paidAt: -1 }),
+  paymentCollection.createIndex({ technicianEmail: 1, paidAt: -1 }),
+  paymentCollection.createIndex({ customerId: 1, paidAt: -1 }),
+  paymentCollection.createIndex({ technicianId: 1, paidAt: -1 }),
+  notificationCollection.createIndex(
+    { recipientId: 1, recipientRole: 1, createdAt: -1 },
+    { name: "notification_recipient_created" }
+  ),
+  notificationCollection.createIndex(
+    { dedupeKey: 1 },
+    {
+      name: "notification_dedupe",
+      unique: true,
+      partialFilterExpression: { dedupeKey: { $type: "string" } },
+    }
+  ),
 ]);
+
+const createNotification = async (
+  recipientId,
+  recipientRole,
+  notification,
+  session
+) => {
+  if (!recipientId) return;
+  if (!ObjectId.isValid(recipientId)) {
+    throw new Error("Cannot create a notification for an invalid recipient ID");
+  }
+  if (
+    !notificationRoles.includes(recipientRole) ||
+    !notificationTypes.includes(notification.type)
+  ) {
+    throw new Error("Cannot create a notification with an invalid role or type");
+  }
+  const document = {
+    recipientId: new ObjectId(recipientId),
+    recipientRole,
+    title: notification.title,
+    message: notification.message,
+    type: notification.type,
+    ...(notification.relatedId ? { relatedId: notification.relatedId } : {}),
+    ...(notification.href ? { href: notification.href } : {}),
+    ...(notification.dedupeKey
+      ? {
+          dedupeKey: `${recipientRole}:${recipientId}:${notification.dedupeKey}`,
+        }
+      : {}),
+    readAt: null,
+    createdAt: new Date(),
+  };
+  const options = session ? { session } : {};
+  if (document.dedupeKey) {
+    await notificationCollection.updateOne(
+      { dedupeKey: document.dedupeKey },
+      { $setOnInsert: document },
+      { ...options, upsert: true }
+    );
+    return;
+  }
+  await notificationCollection.insertOne(document, options);
+};
+
+const notifyAdmins = async (notification, session) => {
+  const admins = await userCollection
+    .find({ role: "admin" }, session ? { session } : {})
+    .project({ _id: 1 })
+    .toArray();
+  await Promise.all(
+    admins.map((admin) =>
+      createNotification(
+        admin._id.toString(),
+        "admin",
+        notification,
+        session
+      )
+    )
+  );
+};
+
+const notifySafely = async (label, work) => {
+  try {
+    await work();
+  } catch (error) {
+    console.error(`Unable to create ${label} notification(s):`, error);
+  }
+};
+
+const notificationHref = (role, bookingId) => {
+  if (role === "customer") {
+    return `/customer-dashboard/bookings/${encodeURIComponent(bookingId)}`;
+  }
+  if (role === "technician") {
+    return `/technician-dashboard/requests/${encodeURIComponent(bookingId)}`;
+  }
+  return "/admin-dashboard/all-bookings";
+};
 
 const syncRoleProfile = async (user) => {
   const roleProfile = roleProfiles[user.role];
@@ -122,6 +307,22 @@ const watchUserRegistrations = async () => {
       changeStream = userCollection.watch([], { fullDocument: "updateLookup" });
       for await (const change of changeStream) {
         if (change.fullDocument) {
+          if (
+            change.operationType === "insert" &&
+            ["customer", "technician"].includes(change.fullDocument.role)
+          ) {
+            const roleName = change.fullDocument.role;
+            await notifySafely("user registration", () =>
+              notifyAdmins({
+                type: "user_registered",
+                title: `New ${roleName} registered`,
+                message: `${change.fullDocument.name || "A new user"} joined HomeFix as a ${roleName}.`,
+                relatedId: change.fullDocument._id.toString(),
+                href: "/admin-dashboard/users",
+                dedupeKey: `user-registered:${change.fullDocument._id}`,
+              })
+            );
+          }
           await syncRoleProfile(change.fullDocument);
         }
       }
@@ -299,6 +500,148 @@ const getAccountById = async (id, role) => {
     : null;
 };
 
+const getNotificationRecipient = async (role, userId) => {
+  if (!notificationRoles.includes(role) || !ObjectId.isValid(userId)) {
+    return null;
+  }
+  return userCollection.findOne({
+    _id: new ObjectId(userId),
+    role,
+  });
+};
+
+const serializeNotification = (notification) => ({
+  ...notification,
+  _id: notification._id.toString(),
+  recipientId: notification.recipientId.toString(),
+  createdAt: notification.createdAt.toISOString(),
+  readAt: notification.readAt?.toISOString() ?? null,
+});
+
+app.get("/notifications/:role/:userId", async (req, res) => {
+  if (!(await requireNotificationApiSecret(req, res))) return;
+  const recipient = await getNotificationRecipient(
+    req.params.role,
+    req.params.userId
+  );
+  if (!recipient) {
+    return res.status(404).send({ message: "Notification recipient not found" });
+  }
+  const recipientId = recipient._id;
+  const [notifications, unreadCount] = await Promise.all([
+    notificationCollection
+      .find({ recipientId, recipientRole: req.params.role })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray(),
+    notificationCollection.countDocuments({
+      recipientId,
+      recipientRole: req.params.role,
+      readAt: null,
+    }),
+  ]);
+  res.send({
+    notifications: notifications.map(serializeNotification),
+    unreadCount,
+  });
+});
+
+app.get("/notifications/:role/:userId/unread-count", async (req, res) => {
+  if (!(await requireNotificationApiSecret(req, res))) return;
+  const recipient = await getNotificationRecipient(
+    req.params.role,
+    req.params.userId
+  );
+  if (!recipient) {
+    return res.status(404).send({ message: "Notification recipient not found" });
+  }
+  const unreadCount = await notificationCollection.countDocuments({
+    recipientId: recipient._id,
+    recipientRole: req.params.role,
+    readAt: null,
+  });
+  res.send({ unreadCount });
+});
+
+app.patch("/notifications/:role/:userId/read-all", async (req, res) => {
+  if (!(await requireNotificationApiSecret(req, res))) return;
+  const recipient = await getNotificationRecipient(
+    req.params.role,
+    req.params.userId
+  );
+  if (!recipient) {
+    return res.status(404).send({ message: "Notification recipient not found" });
+  }
+  const result = await notificationCollection.updateMany(
+    {
+      recipientId: recipient._id,
+      recipientRole: req.params.role,
+      readAt: null,
+    },
+    { $set: { readAt: new Date() } }
+  );
+  res.send({ updatedCount: result.modifiedCount });
+});
+
+app.patch(
+  "/notifications/:role/:userId/:notificationId/read",
+  async (req, res) => {
+    if (!(await requireNotificationApiSecret(req, res))) return;
+    const recipient = await getNotificationRecipient(
+      req.params.role,
+      req.params.userId
+    );
+    if (!recipient) {
+      return res.status(404).send({ message: "Notification recipient not found" });
+    }
+    if (!ObjectId.isValid(req.params.notificationId)) {
+      return res.status(400).send({ message: "Invalid notification ID" });
+    }
+    const result = await notificationCollection.updateOne(
+      {
+        _id: new ObjectId(req.params.notificationId),
+        recipientId: recipient._id,
+        recipientRole: req.params.role,
+      },
+      { $set: { readAt: new Date() } }
+    );
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "Notification not found" });
+    }
+    res.send({ ok: true });
+  }
+);
+
+app.delete("/notifications/:role/:userId/:notificationId", async (req, res) => {
+  if (!(await requireNotificationApiSecret(req, res))) return;
+  const recipient = await getNotificationRecipient(
+    req.params.role,
+    req.params.userId
+  );
+  if (!recipient) {
+    return res.status(404).send({ message: "Notification recipient not found" });
+  }
+  if (!ObjectId.isValid(req.params.notificationId)) {
+    return res.status(400).send({ message: "Invalid notification ID" });
+  }
+  const result = await notificationCollection.deleteOne({
+    _id: new ObjectId(req.params.notificationId),
+    recipientId: recipient._id,
+    recipientRole: req.params.role,
+  });
+  if (result.deletedCount === 0) {
+    return res.status(404).send({ message: "Notification not found" });
+  }
+  res.send({ ok: true });
+});
+
+const getPaymentOwnerFilter = (userId, idField, emailField, email) => ({
+  $or: [
+    { [idField]: userId },
+    { [idField]: { $exists: false }, [emailField]: email },
+  ],
+});
+
 const serviceFields = [
   "title",
   "category",
@@ -402,6 +745,16 @@ app.post("/technicians/:id/services", async (req, res) => {
   service.createdAt = new Date();
 
   const result = await serviceCollection.insertOne(service);
+  await notifySafely("service submission", () =>
+    notifyAdmins({
+      type: "service_submitted",
+      title: "Service submitted for approval",
+      message: `${service.title || "A service"} was submitted by ${service.technicianName || "a technician"}.`,
+      relatedId: result.insertedId.toString(),
+      href: "/admin-dashboard/approvals",
+      dedupeKey: `service-submitted:${result.insertedId}`,
+    })
+  );
   res.status(201).send({ ...service, _id: result.insertedId });
 });
 
@@ -458,8 +811,28 @@ app.patch("/services/:id", async (req, res) => {
   if (Object.keys(updates).length === 0) {
     return res.status(400).send({ message: "No service fields to update" });
   }
+  const submittedForApproval = serviceFields.some(
+    (field) => req.body[field] !== undefined
+  );
+  if (submittedForApproval) {
+    updates.approvalStatus = "pending";
+  }
+  updates.updatedAt = new Date();
 
   const result = await serviceCollection.updateOne(filter, { $set: updates });
+  if (result.matchedCount === 1 && submittedForApproval) {
+    const updatedAt = updates.updatedAt;
+    await notifySafely("service update submission", () =>
+      notifyAdmins({
+        type: "service_submitted",
+        title: "Service update needs approval",
+        message: `${updates.title || service.title} was updated by ${technician.name || "a technician"} and needs review.`,
+        relatedId: req.params.id,
+        href: "/admin-dashboard/approvals",
+        dedupeKey: `service-update:${req.params.id}:${updatedAt.getTime()}`,
+      })
+    );
+  }
   res.send(result);
 });
 
@@ -536,6 +909,8 @@ app.post("/bookings", async (req, res) => {
     category: service.category,
     basePrice: service.basePrice,
     technicianName: service.technicianName,
+    technicianImage:
+      typeof technician?.image === "string" ? technician.image : "",
     technicianEmail: service.technicianEmail,
     technicianId:
       technician?._id.toString() ?? service.technicianId ?? "",
@@ -568,6 +943,36 @@ app.post("/bookings", async (req, res) => {
   booking.preferredDate = new Date(preferredDateValue);
 
   const result = await bookingCollection.insertOne(booking);
+  const bookingId = result.insertedId.toString();
+  await notifySafely("booking creation", async () => {
+    const notifications = [
+      createNotification(booking.customerId, "customer", {
+        type: "booking_created",
+        title: "Booking request submitted",
+        message: `Your request for ${booking.serviceTitle} was sent successfully.`,
+        relatedId: bookingId,
+        href: notificationHref("customer", bookingId),
+        dedupeKey: `booking-created:${bookingId}`,
+      }),
+      createNotification(booking.technicianId, "technician", {
+        type: "booking_created",
+        title: "New booking request",
+        message: `${booking.customerName || "A customer"} requested ${booking.serviceTitle}.`,
+        relatedId: bookingId,
+        href: notificationHref("technician", bookingId),
+        dedupeKey: `booking-created:${bookingId}`,
+      }),
+      notifyAdmins({
+        type: "booking_created",
+        title: "New booking created",
+        message: `${booking.customerName || "A customer"} booked ${booking.serviceTitle}.`,
+        relatedId: bookingId,
+        href: notificationHref("admin", bookingId),
+        dedupeKey: `booking-created:${bookingId}`,
+      }),
+    ];
+    await Promise.all(notifications);
+  });
   res.status(201).send({ ...booking, _id: result.insertedId });
 });
 
@@ -639,6 +1044,117 @@ app.get("/technicians/:id/bookings/:bookingId", async (req, res) => {
   res.send(booking);
 });
 
+const verifySignedApiRequest = (req, res, expectedRole) => {
+  const secret = process.env.HOMEFIX_PAYMENT_API_SECRET;
+  const userId = req.headers["x-homefix-user-id"];
+  const role = req.headers["x-homefix-user-role"];
+  const timestamp = req.headers["x-homefix-request-time"];
+  const signature = req.headers["x-homefix-request-signature"];
+  const requestTime = Number(timestamp);
+  if (
+    !secret ||
+    role !== expectedRole ||
+    typeof userId !== "string" ||
+    !ObjectId.isValid(userId) ||
+    typeof timestamp !== "string" ||
+    !/^\d+$/.test(timestamp) ||
+    !Number.isSafeInteger(requestTime) ||
+    Math.abs(Date.now() - requestTime) > 5 * 60 * 1000 ||
+    typeof signature !== "string" ||
+    !/^[a-f\d]{64}$/i.test(signature)
+  ) {
+    res.status(401).send({ message: "Unauthorized request" });
+    return null;
+  }
+  const expectedSignature = createHmac("sha256", secret)
+    .update(
+      `${timestamp}\n${req.method.toUpperCase()}\n${req.path}\n${role}\n${userId}`
+    )
+    .digest();
+  const suppliedSignature = Buffer.from(signature, "hex");
+  if (
+    suppliedSignature.length !== expectedSignature.length ||
+    !timingSafeEqual(suppliedSignature, expectedSignature)
+  ) {
+    res.status(401).send({ message: "Unauthorized request" });
+    return null;
+  }
+  return { userId, role };
+};
+
+app.patch("/bookings/:id/cancel", async (req, res) => {
+  const principal = verifySignedApiRequest(req, res, "customer");
+  if (!principal) return;
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid booking ID" });
+  }
+  const customer = await getAccountById(principal.userId, "customer");
+  if (!customer) {
+    return res.status(404).send({ message: "Customer not found" });
+  }
+  const bookingId = new ObjectId(req.params.id);
+  const booking = await bookingCollection.findOne({
+    _id: bookingId,
+    customerEmail: customer.email,
+  });
+  if (!booking) {
+    return res.status(404).send({ message: "Booking not found" });
+  }
+  if (!["requested", "pending"].includes(booking.status)) {
+    return res.status(409).send({
+      message:
+        booking.status === "accepted" || booking.status === "in-progress"
+          ? "This booking was accepted. Contact your technician to request cancellation."
+          : "Only pending booking requests can be cancelled.",
+    });
+  }
+
+  const updatedAt = new Date();
+  const result = await bookingCollection.updateOne(
+    {
+      _id: bookingId,
+      customerEmail: customer.email,
+      status: { $in: ["requested", "pending"] },
+    },
+    { $set: { status: "cancelled", updatedAt } }
+  );
+  if (result.matchedCount !== 1) {
+    return res.status(409).send({
+      message: "The booking status changed. Refresh and try again.",
+    });
+  }
+
+  const bookingIdString = bookingId.toString();
+  await notifySafely("customer booking cancellation", async () => {
+    const notice = {
+      type: "booking_cancelled",
+      title: "Booking cancelled",
+      message: `Your request for ${booking.serviceTitle} was cancelled.`,
+      relatedId: bookingIdString,
+      dedupeKey: `booking-status:${bookingIdString}:cancelled`,
+    };
+    await Promise.all([
+      createNotification(booking.customerId, "customer", {
+        ...notice,
+        href: notificationHref("customer", bookingIdString),
+      }),
+      createNotification(booking.technicianId, "technician", {
+        ...notice,
+        title: "Customer cancelled a booking",
+        message: `${booking.customerName || "A customer"} cancelled ${booking.serviceTitle}.`,
+        href: notificationHref("technician", bookingIdString),
+      }),
+      notifyAdmins({
+        ...notice,
+        title: "Booking cancelled",
+        message: `${booking.customerName || "A customer"} cancelled ${booking.serviceTitle}.`,
+        href: notificationHref("admin", bookingIdString),
+      }),
+    ]);
+  });
+  res.send(await bookingCollection.findOne({ _id: bookingId }));
+});
+
 app.patch("/bookings/:id", async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ message: "Invalid booking ID" });
@@ -662,6 +1178,13 @@ app.patch("/bookings/:id", async (req, res) => {
     });
     technicianUpdate = true;
   } else if (req.body.customerId !== undefined) {
+    const principal = verifySignedApiRequest(req, res, "customer");
+    if (!principal || principal.userId !== req.body.customerId) {
+      if (principal) {
+        res.status(403).send({ message: "Customer identity does not match" });
+      }
+      return;
+    }
     account = await getAccountById(req.body.customerId, "customer");
     if (!account) {
       return res.status(404).send({ message: "Customer not found" });
@@ -686,7 +1209,7 @@ app.patch("/bookings/:id", async (req, res) => {
       }
     : {
         requested: ["cancelled"],
-        accepted: ["cancelled"],
+        pending: ["cancelled"],
       };
   if (!(transitions[booking.status] || []).includes(req.body.status)) {
     return res.status(400).send({ message: "Invalid booking status transition" });
@@ -719,6 +1242,73 @@ app.patch("/bookings/:id", async (req, res) => {
   if (result.matchedCount === 0) {
     return res.status(409).send({
       message: "The booking status changed. Refresh and try again.",
+    });
+  }
+  const bookingIdString = bookingId.toString();
+  const statusMessages = {
+    accepted: {
+      title: "Technician accepted your booking",
+      message: `Your request for ${booking.serviceTitle} was accepted.`,
+      type: "booking_updated",
+    },
+    rejected: {
+      title: "Technician declined your booking",
+      message: `Your request for ${booking.serviceTitle} was declined.`,
+      type: "booking_updated",
+    },
+    "in-progress": {
+      title: "Your service has started",
+      message: `The technician started your ${booking.serviceTitle} service.`,
+      type: "booking_updated",
+    },
+    completed: {
+      title: "Your service is complete",
+      message: `The technician marked ${booking.serviceTitle} as complete.`,
+      type: "booking_updated",
+    },
+    cancelled: {
+      title: "Booking cancelled",
+      message: `The booking for ${booking.serviceTitle} was cancelled.`,
+      type: "booking_cancelled",
+    },
+  };
+  const statusNotification = statusMessages[req.body.status];
+  if (statusNotification) {
+    await notifySafely("booking status update", async () => {
+      const recipients = technicianUpdate
+        ? [
+            createNotification(booking.customerId, "customer", {
+              ...statusNotification,
+              relatedId: bookingIdString,
+              href: notificationHref("customer", bookingIdString),
+              dedupeKey: `booking-status:${bookingIdString}:${req.body.status}`,
+            }),
+          ]
+        : [
+            createNotification(booking.technicianId, "technician", {
+              ...statusNotification,
+              title: "Customer cancelled a booking",
+              message: `${booking.customerName || "A customer"} cancelled ${booking.serviceTitle}.`,
+              relatedId: bookingIdString,
+              href: notificationHref("technician", bookingIdString),
+              dedupeKey: `booking-status:${bookingIdString}:${req.body.status}`,
+            }),
+            createNotification(booking.customerId, "customer", {
+              ...statusNotification,
+              relatedId: bookingIdString,
+              href: notificationHref("customer", bookingIdString),
+              dedupeKey: `booking-status:${bookingIdString}:${req.body.status}`,
+            }),
+            notifyAdmins({
+              ...statusNotification,
+              title: "Booking cancelled",
+              message: `${booking.customerName || "A customer"} cancelled ${booking.serviceTitle}.`,
+              relatedId: bookingIdString,
+              href: notificationHref("admin", bookingIdString),
+              dedupeKey: `booking-status:${bookingIdString}:${req.body.status}`,
+            }),
+          ];
+      await Promise.all(recipients);
     });
   }
   res.send(await bookingCollection.findOne({ _id: bookingId }));
@@ -1023,12 +1613,35 @@ app.patch("/admin/:adminId/users/:userId/ban", async (req, res) => {
   if (typeof req.body.banned !== "boolean") {
     return res.status(400).send({ message: "banned must be a boolean" });
   }
+  const user = await userCollection.findOne({
+    _id: new ObjectId(req.params.userId),
+  });
+  if (!user) {
+    return res.status(404).send({ message: "User not found" });
+  }
+  const updatedAt = new Date();
   const result = await userCollection.updateOne(
     { _id: new ObjectId(req.params.userId) },
-    { $set: { banned: req.body.banned, updatedAt: new Date() } }
+    { $set: { banned: req.body.banned, updatedAt } }
   );
   if (result.matchedCount === 0) {
     return res.status(404).send({ message: "User not found" });
+  }
+  if (user.role === "customer" || user.role === "technician") {
+    await notifySafely("account status update", () =>
+      createNotification(user._id.toString(), user.role, {
+        type: "account_update",
+        title: req.body.banned ? "Account suspended" : "Account access restored",
+        message: req.body.banned
+          ? "Your HomeFix account has been suspended. Contact support if you believe this is a mistake."
+          : "Your HomeFix account access has been restored.",
+        href:
+          user.role === "customer"
+            ? "/customer-dashboard/profile"
+            : "/technician-dashboard/profile",
+        dedupeKey: `account-status:${user._id}:${req.body.banned}:${updatedAt.getTime()}`,
+      })
+    );
   }
   res.send(result);
 });
@@ -1295,6 +1908,11 @@ app.patch("/admin/:adminId/services/:serviceId", async (req, res) => {
   if (!ObjectId.isValid(req.params.serviceId)) {
     return res.status(400).send({ message: "Invalid service ID" });
   }
+  const serviceId = new ObjectId(req.params.serviceId);
+  const service = await serviceCollection.findOne({ _id: serviceId });
+  if (!service) {
+    return res.status(404).send({ message: "Service not found" });
+  }
   const updates = {};
   for (const field of serviceFields) {
     if (req.body[field] !== undefined) {
@@ -1328,11 +1946,39 @@ app.patch("/admin/:adminId/services/:serviceId", async (req, res) => {
     return res.status(400).send({ message: "No service fields to update" });
   }
   const result = await serviceCollection.updateOne(
-    { _id: new ObjectId(req.params.serviceId) },
+    { _id: serviceId },
     { $set: updates }
   );
-  if (result.matchedCount === 0) {
+  if (result.matchedCount !== 1) {
     return res.status(404).send({ message: "Service not found" });
+  }
+  if (
+    (updates.approvalStatus &&
+      updates.approvalStatus !== service.approvalStatus) ||
+    (updates.isAvailable === false && service.isAvailable !== false)
+  ) {
+    const technician = await userCollection.findOne({
+      email: service.technicianEmail,
+      role: "technician",
+    });
+    if (technician) {
+      const decision = updates.approvalStatus;
+      const suspended = updates.isAvailable === false;
+      await notifySafely("admin service update", () =>
+        createNotification(technician._id.toString(), "technician", {
+          type: suspended ? "service_removed" : "service_decision",
+          title: suspended
+            ? "Service suspended"
+            : `Service ${decision}`,
+          message: suspended
+            ? `${service.title || "Your service"} was suspended by the HomeFix admin team.`
+            : `${service.title || "Your service"} was ${decision} by the HomeFix admin team.`,
+          relatedId: req.params.serviceId,
+          href: "/technician-dashboard/my-services",
+          dedupeKey: `admin-service-update:${req.params.serviceId}:${decision || "suspended"}:${Date.now()}`,
+        })
+      );
+    }
   }
   res.send(result);
 });
@@ -1345,12 +1991,37 @@ app.patch("/admin/:adminId/services/:serviceId/approval", async (req, res) => {
   if (!approvalStatuses.includes(req.body.approvalStatus)) {
     return res.status(400).send({ message: "Invalid approvalStatus" });
   }
-  const result = await serviceCollection.updateOne(
-    { _id: new ObjectId(req.params.serviceId) },
-    { $set: { approvalStatus: req.body.approvalStatus } }
-  );
-  if (result.matchedCount === 0) {
+  const serviceId = new ObjectId(req.params.serviceId);
+  const service = await serviceCollection.findOne({ _id: serviceId });
+  if (!service) {
     return res.status(404).send({ message: "Service not found" });
+  }
+  const updatedAt = new Date();
+  const result = await serviceCollection.updateOne(
+    { _id: serviceId },
+    { $set: { approvalStatus: req.body.approvalStatus, updatedAt } }
+  );
+  if (
+    result.matchedCount === 1 &&
+    service.approvalStatus !== req.body.approvalStatus
+  ) {
+    const technician = await userCollection.findOne({
+      email: service.technicianEmail,
+      role: "technician",
+    });
+    if (technician) {
+      const decision = req.body.approvalStatus;
+      await notifySafely("service approval decision", () =>
+        createNotification(technician._id.toString(), "technician", {
+          type: "service_decision",
+          title: `Service ${decision}`,
+          message: `${service.title || "Your service"} was ${decision} by the HomeFix admin team.`,
+          relatedId: req.params.serviceId,
+          href: "/technician-dashboard/my-services",
+          dedupeKey: `service-decision:${req.params.serviceId}:${decision}:${updatedAt.getTime()}`,
+        })
+      );
+    }
   }
   res.send(result);
 });
@@ -1360,11 +2031,32 @@ app.delete("/admin/:adminId/services/:serviceId", async (req, res) => {
   if (!ObjectId.isValid(req.params.serviceId)) {
     return res.status(400).send({ message: "Invalid service ID" });
   }
+  const serviceId = new ObjectId(req.params.serviceId);
+  const service = await serviceCollection.findOne({ _id: serviceId });
+  if (!service) {
+    return res.status(404).send({ message: "Service not found" });
+  }
   const result = await serviceCollection.deleteOne({
-    _id: new ObjectId(req.params.serviceId),
+    _id: serviceId,
   });
   if (result.deletedCount === 0) {
     return res.status(404).send({ message: "Service not found" });
+  }
+  const technician = await userCollection.findOne({
+    email: service.technicianEmail,
+    role: "technician",
+  });
+  if (technician) {
+    await notifySafely("service removal", () =>
+      createNotification(technician._id.toString(), "technician", {
+        type: "service_removed",
+        title: "Service removed",
+        message: `${service.title || "Your service"} was removed by the HomeFix admin team.`,
+        relatedId: req.params.serviceId,
+        href: "/technician-dashboard/my-services",
+        dedupeKey: `service-removed:${req.params.serviceId}`,
+      })
+    );
   }
   res.send(result);
 });
@@ -1423,6 +2115,11 @@ app.patch("/admin/:adminId/bookings/:bookingId", async (req, res) => {
   if (!ObjectId.isValid(req.params.bookingId)) {
     return res.status(400).send({ message: "Invalid booking ID" });
   }
+  const bookingId = new ObjectId(req.params.bookingId);
+  const booking = await bookingCollection.findOne({ _id: bookingId });
+  if (!booking) {
+    return res.status(404).send({ message: "Booking not found" });
+  }
   const updates = {};
   for (const field of ["customerPhone", "address", "problemDescription"]) {
     if (req.body[field] !== undefined) {
@@ -1459,11 +2156,56 @@ app.patch("/admin/:adminId/bookings/:bookingId", async (req, res) => {
     return res.status(400).send({ message: "No booking fields to update" });
   }
   const result = await bookingCollection.updateOne(
-    { _id: new ObjectId(req.params.bookingId) },
+    { _id: bookingId },
     { $set: updates }
   );
   if (result.matchedCount === 0) {
     return res.status(404).send({ message: "Booking not found" });
+  }
+  const bookingIdString = bookingId.toString();
+  if (updates.status && updates.status !== booking.status) {
+    const cancelled = updates.status === "cancelled";
+    await notifySafely("admin booking status update", async () => {
+      const notice = {
+        type: cancelled ? "booking_cancelled" : "booking_updated",
+        title: cancelled ? "Booking cancelled" : "Booking status updated",
+        message: cancelled
+          ? `The booking for ${booking.serviceTitle} was cancelled by an admin.`
+          : `The booking for ${booking.serviceTitle} was updated to ${updates.status}.`,
+        relatedId: bookingIdString,
+        dedupeKey: `admin-booking-status:${bookingIdString}:${updates.status}`,
+      };
+      await Promise.all([
+        createNotification(booking.customerId, "customer", {
+          ...notice,
+          href: notificationHref("customer", bookingIdString),
+        }),
+        createNotification(booking.technicianId, "technician", {
+          ...notice,
+          href: notificationHref("technician", bookingIdString),
+        }),
+      ]);
+    });
+  } else if (Object.keys(updates).length > 0) {
+    await notifySafely("booking details update", async () => {
+      const notice = {
+        type: "booking_updated",
+        title: "Booking details updated",
+        message: `The details for your ${booking.serviceTitle} booking were updated by an admin.`,
+        relatedId: bookingIdString,
+        dedupeKey: `admin-booking-details:${bookingIdString}:${Date.now()}`,
+      };
+      await Promise.all([
+        createNotification(booking.customerId, "customer", {
+          ...notice,
+          href: notificationHref("customer", bookingIdString),
+        }),
+        createNotification(booking.technicianId, "technician", {
+          ...notice,
+          href: notificationHref("technician", bookingIdString),
+        }),
+      ]);
+    });
   }
   res.send(result);
 });
@@ -1548,18 +2290,647 @@ app.get("/admin/:adminId/reports", async (req, res) => {
   });
 });
 
+const paymentStatuses = ["paid", "pending", "failed", "refunded"];
+
+const getPaymentFilter = async (query) => {
+  const filter = {};
+  if (query.paymentStatus !== undefined) {
+    if (!paymentStatuses.includes(query.paymentStatus)) return null;
+    filter.paymentStatus = query.paymentStatus;
+  }
+  if (query.bookingId !== undefined) {
+    if (typeof query.bookingId !== "string" || !query.bookingId) return null;
+    filter.bookingId = query.bookingId;
+  }
+  if (query.search !== undefined) {
+    if (typeof query.search !== "string" || query.search.length > 100) return null;
+    const search = new RegExp(escapeRegex(query.search), "i");
+    filter.$or = [
+      { serviceTitle: search },
+      { customerName: search },
+      { customerEmail: search },
+      { technicianName: search },
+      { technicianEmail: search },
+      { transactionId: search },
+      { stripeSessionId: search },
+      { bookingId: search },
+    ];
+  }
+  if (query.from !== undefined || query.to !== undefined) {
+    const paidAt = {};
+    if (query.from !== undefined) {
+      const from = new Date(query.from);
+      if (Number.isNaN(from.getTime())) return null;
+      paidAt.$gte = from;
+    }
+    if (query.to !== undefined) {
+      const to = new Date(query.to);
+      if (Number.isNaN(to.getTime())) return null;
+      paidAt.$lte = to;
+    }
+    filter.paidAt = paidAt;
+  }
+  if (query.customerId !== undefined) {
+    const customer = await getAccountById(query.customerId, "customer");
+    if (!customer) return null;
+    filter.$and = [
+      ...(filter.$and || []),
+      getPaymentOwnerFilter(customer._id.toString(), "customerId", "customerEmail", customer.email),
+    ];
+  }
+  if (query.technicianId !== undefined) {
+    const technician = await getAccountById(query.technicianId, "technician");
+    if (!technician) return null;
+    filter.$and = [
+      ...(filter.$and || []),
+      getPaymentOwnerFilter(
+        technician._id.toString(),
+        "technicianId",
+        "technicianEmail",
+        technician.email
+      ),
+    ];
+  }
+  return filter;
+};
+
+const getPaymentStatistics = async (filter) => {
+  const [total, byStatus] = await Promise.all([
+    paymentCollection.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: null,
+          count: { $sum: 1 },
+          revenue: {
+            $sum: {
+              $cond: [
+                { $eq: ["$paymentStatus", "paid"] },
+                "$amount",
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]).toArray(),
+    paymentCollection.aggregate([
+      { $match: filter },
+      { $group: { _id: "$paymentStatus", count: { $sum: 1 } } },
+    ]).toArray(),
+  ]);
+  return {
+    totalPayments: total[0]?.count || 0,
+    totalRevenue: total[0]?.revenue || 0,
+    currency: "BDT",
+    byStatus: Object.fromEntries(
+      byStatus.map(({ _id, count }) => [_id || "unknown", count])
+    ),
+  };
+};
+
+const getPaymentDetails = async (payment) => {
+  const booking = ObjectId.isValid(payment.bookingId)
+    ? await bookingCollection.findOne({ _id: new ObjectId(payment.bookingId) })
+    : null;
+  return { ...payment, booking: booking || null };
+};
+
+app.post("/webhooks/stripe", async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
+    console.error("Stripe webhook received but STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET is missing.");
+    return res.status(503).send({ message: "Stripe webhook is not configured" });
+  }
+  const signature = req.headers["stripe-signature"];
+  if (typeof signature !== "string" || !Buffer.isBuffer(req.rawBody)) {
+    return res.status(400).send({ message: "Missing Stripe signature or request body" });
+  }
+
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.rawBody,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (error) {
+    console.error("Stripe webhook signature verification failed:", error.message);
+    return res.status(400).send({ message: "Invalid Stripe webhook signature" });
+  }
+
+  if (
+    [
+      "checkout.session.async_payment_failed",
+      "checkout.session.expired",
+      "payment_intent.payment_failed",
+    ].includes(event.type)
+  ) {
+    const checkoutSession = event.data.object;
+    const failedBookingId =
+      checkoutSession.metadata?.bookingId || checkoutSession.client_reference_id;
+    if (ObjectId.isValid(failedBookingId)) {
+      const booking = await bookingCollection.findOne({
+        _id: new ObjectId(failedBookingId),
+      });
+      if (booking) {
+        const expired = event.type === "checkout.session.expired";
+        const notification = (role) => ({
+          type: "payment_issue",
+          title: expired ? "Payment session expired" : "Payment could not be completed",
+          message:
+            role === "admin"
+              ? `Checkout for ${booking.serviceTitle} ${
+                  expired ? "expired before payment" : "failed"
+                }.`
+              : expired
+                ? `The payment session for ${booking.serviceTitle} expired before payment was verified.`
+                : `The payment for ${booking.serviceTitle} was not completed. You can try again from your payments page.`,
+          relatedId: booking._id.toString(),
+          href:
+            role === "customer"
+              ? "/customer-dashboard/payments"
+              : role === "technician"
+                ? "/technician-dashboard/payments"
+                : "/admin-dashboard/transactions",
+          dedupeKey: `payment-issue:${event.id}`,
+        });
+        try {
+          await Promise.all([
+            createNotification(
+              booking.customerId,
+              "customer",
+              notification("customer")
+            ),
+            createNotification(
+              booking.technicianId,
+              "technician",
+              notification("technician")
+            ),
+            notifyAdmins(notification("admin")),
+          ]);
+        } catch (error) {
+          console.error("Unable to create payment issue notifications:", error);
+          return res
+            .status(500)
+            .send({ message: "Could not create payment issue notifications" });
+        }
+      }
+    }
+    console.info(`Acknowledged ${event.type}; no payment record was created.`);
+    return res.send({ received: true, paymentRecorded: false });
+  }
+  if (
+    event.type === "checkout.session.completed" &&
+    event.data.object.payment_status !== "paid"
+  ) {
+    const checkoutSession = event.data.object;
+    const processingBookingId =
+      checkoutSession.metadata?.bookingId || checkoutSession.client_reference_id;
+    if (ObjectId.isValid(processingBookingId)) {
+      const booking = await bookingCollection.findOne({
+        _id: new ObjectId(processingBookingId),
+      });
+      if (booking) {
+        try {
+          const notice = (role) => ({
+            type: "payment_processing",
+            title: "Payment is processing",
+            message:
+              role === "admin"
+                ? `Checkout for ${booking.serviceTitle} is awaiting payment provider verification.`
+                : `Your payment for ${booking.serviceTitle} is still being verified by the payment provider.`,
+            relatedId: booking._id.toString(),
+            href:
+              role === "customer"
+                ? "/customer-dashboard/payments"
+                : role === "technician"
+                  ? "/technician-dashboard/payments"
+                  : "/admin-dashboard/transactions",
+            dedupeKey: `payment-processing:${checkoutSession.id}`,
+          });
+          await Promise.all([
+            createNotification(booking.customerId, "customer", notice("customer")),
+            notifyAdmins(notice("admin")),
+          ]);
+        } catch (error) {
+          console.error("Unable to create payment processing notifications:", error);
+          return res
+            .status(500)
+            .send({ message: "Could not create payment processing notifications" });
+        }
+      }
+    }
+    return res.send({ received: true, paymentRecorded: false });
+  }
+  if (
+    !["checkout.session.completed", "checkout.session.async_payment_succeeded"].includes(event.type)
+  ) {
+    return res.send({ received: true });
+  }
+
+  try {
+    const checkoutSession = event.data.object;
+    if (checkoutSession.payment_status !== "paid") {
+      return res.send({ received: true, paymentRecorded: false });
+    }
+    const bookingId =
+      checkoutSession.metadata?.bookingId || checkoutSession.client_reference_id;
+    if (!ObjectId.isValid(bookingId)) {
+      return res.status(400).send({ message: "Stripe session has no valid booking reference" });
+    }
+    const expectedSessionAmount = checkoutSession.amount_total;
+    const expectedCurrency = "bdt";
+    const transactionId =
+      typeof checkoutSession.payment_intent === "string"
+        ? checkoutSession.payment_intent
+        : checkoutSession.payment_intent?.id;
+    if (
+      typeof transactionId !== "string" ||
+      typeof expectedSessionAmount !== "number" ||
+      checkoutSession.currency !== expectedCurrency
+    ) {
+      return res.status(400).send({ message: "Stripe session payment details are incomplete" });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.retrieve(transactionId, {
+      expand: ["latest_charge"],
+    });
+    if (
+      paymentIntent.status !== "succeeded" ||
+      paymentIntent.currency !== expectedCurrency
+    ) {
+      return res.status(400).send({ message: "Stripe payment has not succeeded in BDT" });
+    }
+    const bookingObjectId = new ObjectId(bookingId);
+    const databaseSession = client.startSession();
+    let alreadyProcessed = false;
+    try {
+      await databaseSession.withTransaction(async () => {
+        alreadyProcessed = false;
+        const booking = await bookingCollection.findOne(
+          { _id: bookingObjectId },
+          { session: databaseSession }
+        );
+        if (!booking) {
+          throw new Error("Referenced booking was not found");
+        }
+        if (
+          typeof booking.finalAmount !== "number" ||
+          !Number.isFinite(booking.finalAmount) ||
+          booking.finalAmount <= 0
+        ) {
+          throw new Error("Booking has an invalid final amount");
+        }
+        const expectedBookingAmount = Math.round(booking.finalAmount * 100);
+        if (
+          expectedSessionAmount !== expectedBookingAmount ||
+          paymentIntent.amount_received !== expectedBookingAmount
+        ) {
+          throw new Error("Stripe payment amount does not match the booking finalAmount");
+        }
+
+        const existingPayment = await paymentCollection.findOne(
+          {
+            $or: [
+              { bookingId: booking._id.toString() },
+              { stripeSessionId: checkoutSession.id },
+            ],
+          },
+          { session: databaseSession }
+        );
+        const paidAt =
+          paymentIntent.latest_charge &&
+          typeof paymentIntent.latest_charge === "object" &&
+          paymentIntent.latest_charge.created
+            ? new Date(paymentIntent.latest_charge.created * 1000)
+            : new Date(event.created * 1000);
+        if (existingPayment) {
+          if (
+            existingPayment.bookingId !== booking._id.toString() ||
+            existingPayment.stripeSessionId !== checkoutSession.id ||
+            existingPayment.transactionId !== transactionId ||
+            existingPayment.amount !== booking.finalAmount
+          ) {
+            throw new Error("Booking or Stripe session already has a different payment record");
+          }
+          if (
+            booking.paymentStatus === "paid" &&
+            booking.stripeSessionId &&
+            booking.stripeSessionId !== checkoutSession.id
+          ) {
+            throw new Error("Booking is already paid by a different Stripe session");
+          }
+          if (booking.paymentStatus !== "paid") {
+            await bookingCollection.updateOne(
+              { _id: booking._id },
+              {
+                $set: {
+                  paymentStatus: "paid",
+                  transactionId,
+                  stripeSessionId: checkoutSession.id,
+                  paidAt,
+                },
+              },
+              { session: databaseSession }
+            );
+          }
+          await notifyCompletedPayment(
+            booking,
+            existingPayment._id.toString(),
+            checkoutSession.id,
+            databaseSession
+          );
+          alreadyProcessed = true;
+          return;
+        }
+        if (booking.paymentStatus === "paid") {
+          throw new Error("Booking is marked paid without a matching payment record");
+        }
+
+        const [customer, technician] = await Promise.all([
+          getAccountById(booking.customerId, "customer"),
+          getAccountById(booking.technicianId, "technician"),
+        ]);
+        const paymentCustomerName = customer?.name || booking.customerName;
+        const paymentCustomerEmail = customer?.email || booking.customerEmail;
+        const paymentTechnicianName = technician?.name || booking.technicianName;
+        const paymentTechnicianEmail = technician?.email || booking.technicianEmail;
+        const paymentCustomerId = customer?._id.toString() || booking.customerId;
+        const paymentTechnicianId = technician?._id.toString() || booking.technicianId;
+        if (
+          ![
+            booking.serviceTitle,
+            paymentCustomerName,
+            paymentCustomerEmail,
+            paymentTechnicianName,
+            paymentTechnicianEmail,
+            paymentCustomerId,
+            paymentTechnicianId,
+          ]
+            .every((value) => typeof value === "string" && value.trim())
+        ) {
+          throw new Error("Booking is missing required payment ownership or service details");
+        }
+
+        const insertedPayment = await paymentCollection.insertOne(
+          {
+            bookingId: booking._id.toString(),
+            customerId: paymentCustomerId,
+            technicianId: paymentTechnicianId,
+            serviceTitle: booking.serviceTitle,
+            customerName: paymentCustomerName,
+            customerEmail: paymentCustomerEmail,
+            technicianName: paymentTechnicianName,
+            technicianEmail: paymentTechnicianEmail,
+            amount: booking.finalAmount,
+            currency: expectedCurrency,
+            transactionId,
+            stripeSessionId: checkoutSession.id,
+            paymentStatus: "paid",
+            paidAt,
+          },
+          { session: databaseSession }
+        );
+        const bookingUpdate = await bookingCollection.updateOne(
+          { _id: booking._id, paymentStatus: { $ne: "paid" } },
+          {
+            $set: {
+              paymentStatus: "paid",
+              transactionId,
+              stripeSessionId: checkoutSession.id,
+              paidAt,
+            },
+          },
+          { session: databaseSession }
+        );
+        if (bookingUpdate.matchedCount !== 1) {
+          throw new Error("Booking payment status changed while recording payment");
+        }
+        await notifyCompletedPayment(
+          {
+            ...booking,
+            customerId: paymentCustomerId,
+            technicianId: paymentTechnicianId,
+          },
+          insertedPayment.insertedId.toString(),
+          checkoutSession.id,
+          databaseSession
+        );
+      });
+    } finally {
+      await databaseSession.endSession();
+    }
+    res.send({ received: true, paymentRecorded: !alreadyProcessed });
+  } catch (error) {
+    if (error.code === 11000) {
+      const eventTransactionId =
+        typeof event.data.object.payment_intent === "string"
+          ? event.data.object.payment_intent
+          : event.data.object.payment_intent?.id;
+      const existingPayment = await paymentCollection.findOne({
+        $or: [
+          { stripeSessionId: event.data.object.id },
+          { transactionId: eventTransactionId },
+        ],
+      });
+      const eventBookingId =
+        event.data.object.metadata?.bookingId ||
+        event.data.object.client_reference_id;
+      if (
+        existingPayment &&
+        existingPayment.stripeSessionId === event.data.object.id &&
+        existingPayment.bookingId === eventBookingId &&
+        existingPayment.transactionId === eventTransactionId
+      ) {
+        const booking = ObjectId.isValid(eventBookingId)
+          ? await bookingCollection.findOne({
+              _id: new ObjectId(eventBookingId),
+            })
+          : null;
+        if (booking) {
+          await notifySafely("verified payment", () =>
+            notifyCompletedPayment(
+              booking,
+              existingPayment._id.toString(),
+              existingPayment.stripeSessionId
+            )
+          );
+        }
+        return res.send({ received: true, paymentRecorded: false });
+      }
+    }
+    console.error("Stripe payment webhook processing failed:", error.message);
+    return res.status(500).send({ message: "Could not record verified Stripe payment" });
+  }
+});
+
+app.get("/customers/:id/payments/stats", async (req, res) => {
+  const customer = await getAccountById(req.params.id, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  res.send(
+    await getPaymentStatistics(
+      getPaymentOwnerFilter(
+        customer._id.toString(),
+        "customerId",
+        "customerEmail",
+        customer.email
+      )
+    )
+  );
+});
+
+app.get("/customers/:id/payments", async (req, res) => {
+  const customer = await getAccountById(req.params.id, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  res.send(
+    await paymentCollection
+      .find(
+        getPaymentOwnerFilter(
+          customer._id.toString(),
+          "customerId",
+          "customerEmail",
+          customer.email
+        )
+      )
+      .sort({ paidAt: -1 })
+      .toArray()
+  );
+});
+
+app.get("/customers/:id/payments/:paymentId", async (req, res) => {
+  const customer = await getAccountById(req.params.id, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  if (!ObjectId.isValid(req.params.paymentId)) {
+    return res.status(400).send({ message: "Invalid payment ID" });
+  }
+  const payment = await paymentCollection.findOne({
+    _id: new ObjectId(req.params.paymentId),
+    ...getPaymentOwnerFilter(
+      customer._id.toString(),
+      "customerId",
+      "customerEmail",
+      customer.email
+    ),
+  });
+  if (!payment) return res.status(404).send({ message: "Payment not found" });
+  res.send(await getPaymentDetails(payment));
+});
+
+app.get("/technicians/:id/payments/stats", async (req, res) => {
+  const technician = await getAccountById(req.params.id, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  res.send(
+    await getPaymentStatistics(
+      getPaymentOwnerFilter(
+        technician._id.toString(),
+        "technicianId",
+        "technicianEmail",
+        technician.email
+      )
+    )
+  );
+});
+
+app.get("/technicians/:id/payments", async (req, res) => {
+  const technician = await getAccountById(req.params.id, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  res.send(
+    await paymentCollection
+      .find(
+        getPaymentOwnerFilter(
+          technician._id.toString(),
+          "technicianId",
+          "technicianEmail",
+          technician.email
+        )
+      )
+      .sort({ paidAt: -1 })
+      .toArray()
+  );
+});
+
+app.get("/technicians/:id/payments/:paymentId", async (req, res) => {
+  const technician = await getAccountById(req.params.id, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  if (!ObjectId.isValid(req.params.paymentId)) {
+    return res.status(400).send({ message: "Invalid payment ID" });
+  }
+  const payment = await paymentCollection.findOne({
+    _id: new ObjectId(req.params.paymentId),
+    ...getPaymentOwnerFilter(
+      technician._id.toString(),
+      "technicianId",
+      "technicianEmail",
+      technician.email
+    ),
+  });
+  if (!payment) return res.status(404).send({ message: "Payment not found" });
+  res.send(await getPaymentDetails(payment));
+});
+
+app.get("/admin/:adminId/payments/stats", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const filter = await getPaymentFilter(req.query);
+  if (!filter) return res.status(400).send({ message: "Invalid payment filter" });
+  res.send(await getPaymentStatistics(filter));
+});
+
+app.get("/admin/:adminId/payments/customers/:customerId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const customer = await getAccountById(req.params.customerId, "customer");
+  if (!customer) return res.status(404).send({ message: "Customer not found" });
+  res.send(
+    await paymentCollection
+      .find(
+        getPaymentOwnerFilter(
+          customer._id.toString(),
+          "customerId",
+          "customerEmail",
+          customer.email
+        )
+      )
+      .sort({ paidAt: -1 })
+      .toArray()
+  );
+});
+
+app.get("/admin/:adminId/payments/technicians/:technicianId", async (req, res) => {
+  if (!(await requireAdmin(req, res))) return;
+  const technician = await getAccountById(req.params.technicianId, "technician");
+  if (!technician) return res.status(404).send({ message: "Technician not found" });
+  res.send(
+    await paymentCollection
+      .find(
+        getPaymentOwnerFilter(
+          technician._id.toString(),
+          "technicianId",
+          "technicianEmail",
+          technician.email
+        )
+      )
+      .sort({ paidAt: -1 })
+      .toArray()
+  );
+});
+
 app.get("/admin/:adminId/payments", async (req, res) => {
   if (!(await requireAdmin(req, res))) return;
-  res.status(501).send({
-    message: "Payment records are unavailable until payment integration is implemented.",
-  });
+  const filter = await getPaymentFilter(req.query);
+  if (!filter) return res.status(400).send({ message: "Invalid payment filter" });
+  res.send(await paymentCollection.find(filter).sort({ paidAt: -1 }).toArray());
 });
 
 app.get("/admin/:adminId/payments/:paymentId", async (req, res) => {
   if (!(await requireAdmin(req, res))) return;
-  res.status(501).send({
-    message: "Payment records are unavailable until payment integration is implemented.",
+  if (!ObjectId.isValid(req.params.paymentId)) {
+    return res.status(400).send({ message: "Invalid payment ID" });
+  }
+  const payment = await paymentCollection.findOne({
+    _id: new ObjectId(req.params.paymentId),
   });
+  if (!payment) return res.status(404).send({ message: "Payment not found" });
+  res.send(await getPaymentDetails(payment));
 });
 
 // Other routes
@@ -1572,4 +2943,9 @@ app.get("/", (req, res) => {
 // Start the server
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
+  if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
+    console.error(
+      "Stripe payment verification is disabled: configure STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET in the backend environment."
+    );
+  }
 });
